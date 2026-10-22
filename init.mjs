@@ -356,7 +356,19 @@ if ((wantDeps.length || wantDev.length) && !DRY) {
   if (missing.length) {
     const cmds = [deps.length && `${pm} ${add} ${deps.join(" ")}`, devs.length && `${pm} ${add} -D ${devs.join(" ")}`].filter(Boolean);
     const a = await ask(`\nInstall ${missing.length} missing package(s) with ${pm}? [Y/n]: `, "y");
-    if (/^y/i.test(a)) for (const cmd of cmds) { console.log(c.d(`$ ${cmd}`)); execSync(cmd, { stdio: "inherit", cwd: HOST }); }
+    // A failed install never aborts the run (scripts and next steps still follow). npm peer-dependency
+    // conflicts (ERESOLVE, often from optional peers) are retried once with --legacy-peer-deps.
+    const run = (cmd) => { try { execSync(cmd, { stdio: "inherit", cwd: HOST }); return true; } catch { return false; } };
+    if (/^y/i.test(a)) for (const cmd of cmds) {
+      console.log(c.d(`$ ${cmd}`));
+      if (run(cmd)) continue;
+      if (pm === "npm") {
+        const retry = `${cmd} --legacy-peer-deps`;
+        console.log(c.y(`! npm couldn't resolve peer dependencies — retrying: ${retry}`));
+        if (run(retry)) continue;
+      }
+      console.log(c.r(`✗ Package install failed. Fix the error above, then run:\n  ${cmd}`));
+    }
     else console.log(`Run later:\n  ${cmds.join("\n  ")}`);
   }
 }

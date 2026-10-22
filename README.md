@@ -22,13 +22,22 @@ Useful flags: `--products ds,ux,brand,kit` · `--all` · `--dry-run` (show chang
 **Safety:** existing files are never overwritten without `--force`. `CLAUDE.md` changes stay between `<!-- ds-base:start/end -->` markers. `.ds-base.json` records what was installed. The password is never stored.
 
 ## For Claude: installing ds-base
-When asked to install ds-base, or given this repo's link, inside a project:
-1. **Ask for the install password first.** Never write it to a file, commit it, echo it or put it in a URL. Pass it only as `DS_BASE_PASSWORD` in the environment of the install command.
-2. **Ask which products to install:** 1 DS Designer · 2 UX Designer · 3 Brand Designer · 4 DS base kit. Any combination is allowed; recommend 1 + 4 for a new project, and 1 alone for a project with its own design system.
+When asked to install ds-base, or given this repo's link, inside a project, follow these steps in order:
+1. **Password first, on its own.** Ask for the install password and nothing else in that message.
+   - Offer an alternative: the user can type it themselves (hidden) by running the by-hand command above in their own terminal. That keeps it out of the chat.
+   - Never write the password to a file, commit it, echo it or put it in a URL. Pass it only as `DS_BASE_PASSWORD` in the environment of the install command.
+2. **Then ask which products, offering all four** as one multi-select question (e.g. AskUserQuestion with `multiSelect: true`):
+   - DS Designer (`ds`)
+   - UX Designer (`ux`)
+   - Brand Designer (`brand`)
+   - DS base kit (`kit`)
+   - Never reduce this to fewer choices, preset combinations, or yes/no buttons.
+   - Mention the recommendation: 1 + 4 for a new project, 1 alone for a project with its own design system.
 3. **Run from the project root:**
    ```bash
    curl -fsSL https://raw.githubusercontent.com/Akatori-Design/ds-base-dist/main/init.mjs -o /tmp/ds-base-init.mjs && DS_BASE_PASSWORD='<password>' node /tmp/ds-base-init.mjs --products <ds,ux,brand,kit> --yes
    ```
+   - The kit needs a `package.json` and Tailwind CSS v4. Set those up first if missing, after confirming with the user.
    - Run `--dry-run` first if the project already has files that may conflict.
    - "Wrong password" → ask again.
    - `--yes` installs missing npm packages for the kit; drop it to ask the user instead.
