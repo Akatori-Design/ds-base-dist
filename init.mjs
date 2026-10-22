@@ -163,12 +163,16 @@ function detectBase() {
 // ---- prompts -----------------------------------------------------------------------------
 // Line queue: works for a typed TTY and for piped answers (readline.question loses
 // lines that arrive together and never resolves once stdin closes).
-const rl = createInterface({ input: process.stdin, terminal: false });
+let rl = null;
 const lines = [], waiting = [];
 let inputClosed = false;
-rl.on("line", (l) => (waiting.length ? waiting.shift()(l) : lines.push(l)));
-rl.on("close", () => { inputClosed = true; while (waiting.length) waiting.shift()(null); });
-const nextLine = () => (lines.length ? Promise.resolve(lines.shift()) : inputClosed ? Promise.resolve(null) : new Promise((r) => waiting.push(r)));
+const ensureRl = () => {
+  if (rl) return;
+  rl = createInterface({ input: process.stdin, terminal: false });
+  rl.on("line", (l) => (waiting.length ? waiting.shift()(l) : lines.push(l)));
+  rl.on("close", () => { inputClosed = true; while (waiting.length) waiting.shift()(null); });
+};
+const nextLine = () => (ensureRl(), lines.length ? Promise.resolve(lines.shift()) : inputClosed ? Promise.resolve(null) : new Promise((r) => waiting.push(r)));
 const ask = async (q, def) => {
   if (YES) return def;
   process.stdout.write(q);
@@ -185,22 +189,87 @@ const PRODUCTS = {
 };
 const IDS = Object.keys(PRODUCTS);
 
+// Products already installed here (from .ds-base.json; older lock files had mode/uxAgent).
+function installedProducts() {
+  try {
+    const prev = JSON.parse(readFileSync(join(HOST, ".ds-base.json"), "utf8"));
+    if (Array.isArray(prev.products)) return new Set(prev.products.filter((p) => IDS.includes(p)));
+    return new Set(["ds", ...(prev.mode === "all" ? ["kit"] : []), ...(prev.uxAgent ? ["ux"] : [])]);
+  } catch { return new Set(); }
+}
+
+// Checkbox list: ↑/↓ move, Space toggles, Enter confirms. The last row toggles every row.
+function checkboxes(items, initial) {
+  return new Promise((resolve) => {
+    const stdin = process.stdin, out = process.stdout;
+    const rows = [...items, { id: "*", name: "Install all", desc: items.length > 1 ? "every product above" : "" }];
+    const on = new Set(initial);
+    let i = 0, drawn = false;
+    const allOn = () => items.every((it) => on.has(it.id));
+    const draw = () => {
+      if (drawn) out.write(`\x1b[${rows.length}A`);
+      rows.forEach((r, k) => {
+        const checked = r.id === "*" ? allOn() : on.has(r.id);
+        const box = checked ? c.g("[x]") : "[ ]";
+        const cursor = k === i ? c.b("›") : " ";
+        out.write(`\x1b[2K ${cursor} ${box} ${(k === i ? c.b : (x) => x)(r.name.padEnd(16))} ${c.d(r.desc ?? "")}\n`);
+      });
+      drawn = true;
+    };
+    out.write(c.d("  ↑/↓ move · Space select · Enter confirm\n"));
+    draw();
+    stdin.setRawMode(true); stdin.resume(); stdin.setEncoding("utf8");
+    const onKey = (k) => {
+      if (k === "\u0003") { out.write("\n"); process.exit(130); }
+      if (k === "\x1b[A" || k === "k") i = (i + rows.length - 1) % rows.length;
+      else if (k === "\x1b[B" || k === "j") i = (i + 1) % rows.length;
+      else if (k === " ") {
+        const r = rows[i];
+        if (r.id === "*") { const all = allOn(); items.forEach((it) => (all ? on.delete(it.id) : on.add(it.id))); }
+        else on.has(r.id) ? on.delete(r.id) : on.add(r.id);
+      } else if (k === "\r" || k === "\n") {
+        stdin.setRawMode(false); stdin.pause(); stdin.off("data", onKey);
+        return resolve([...on]);
+      }
+      draw();
+    };
+    stdin.on("data", onKey);
+  });
+}
+
 async function chooseProducts() {
+  const installed = installedProducts();
+  const withInstalled = (picked) => new Set([...installed, ...picked]); // installed products are always kept (and updated)
   const fromFlag = opt("products");
   if (fromFlag) {
     const picked = fromFlag.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
     const bad = picked.filter((x) => !IDS.includes(x));
     if (bad.length) die(`Unknown product(s): ${bad.join(", ")}. Use: ${IDS.join(", ")}`);
-    return new Set(picked);
+    return withInstalled(picked);
   }
   if (flag("all")) return new Set(IDS);
-  if (flag("agent")) return new Set(["ds", ...(flag("with-ux") ? ["ux"] : [])]); // legacy flags
-  console.log(`\n${c.b("What do you want to install?")} ${c.d("(any combination)")}`);
-  IDS.forEach((id, i) => console.log(`  ${i + 1}) ${PRODUCTS[id].name.padEnd(16)} ${c.d(PRODUCTS[id].desc)}`));
-  const a = await ask("Choose numbers, comma-separated, or 'all' [1]: ", "1");
-  const picked = /^all$/i.test(a) ? IDS : a.split(/[\s,]+/).map((n) => IDS[Number(n) - 1]).filter(Boolean);
-  if (!picked.length) die(`Nothing chosen. Enter numbers 1–${IDS.length}, e.g. "1,4".`);
-  return new Set(picked);
+  if (flag("agent")) return withInstalled(["ds", ...(flag("with-ux") ? ["ux"] : [])]); // legacy flags
+
+  const remaining = IDS.filter((id) => !installed.has(id));
+  if (installed.size) console.log(`\n${c.b("Installed here:")} ${[...installed].map((id) => PRODUCTS[id].name).join(", ")} ${c.d("— these will be updated")}`);
+  if (!remaining.length) { console.log(c.d("Every product is already installed.")); return installed; }
+
+  console.log(`\n${c.b(installed.size ? "Add more products?" : "What do you want to install?")} ${c.d("(any combination)")}`);
+  if (process.stdin.isTTY && !YES) {
+    const picked = await checkboxes(remaining.map((id) => ({ id, ...PRODUCTS[id] })), installed.size ? [] : ["ds"]);
+    if (!picked.length && !installed.size) die("Nothing chosen. Select at least one product with Space.");
+    return withInstalled(picked);
+  }
+  // Non-interactive (piped answers): numbers, plus one more number for "Install all"
+  remaining.forEach((id, k) => console.log(`  ${k + 1}) ${PRODUCTS[id].name.padEnd(16)} ${c.d(PRODUCTS[id].desc)}`));
+  const allNo = remaining.length + 1;
+  console.log(`  ${allNo}) ${"Install all".padEnd(16)} ${c.d("every product above")}`);
+  const def = installed.size ? "" : "1";
+  const a = await ask(`Choose numbers, comma-separated${def ? ` [${def}]` : " (Enter for none)"}: `, def);
+  const nums = a.split(/[\s,]+/).filter(Boolean).map(Number);
+  const picked = nums.includes(allNo) || /^all$/i.test(a) ? remaining : nums.map((n) => remaining[n - 1]).filter(Boolean);
+  if (!picked.length && !installed.size) die(`Nothing chosen. Enter numbers 1–${allNo}, e.g. "1,4".`);
+  return withInstalled(picked);
 }
 
 // ---- plan & write ------------------------------------------------------------------------
@@ -396,5 +465,5 @@ if (has("ux")) {
   console.log(`  • Mount ${c.b("<DevControls />")} once at the app root (components/ux-tools, dev builds only).`);
 }
 if (has("brand")) console.log(`  • Brand work: ask for the ${c.b("brand-designer")} agent ("define our brand look from these references"). Profiles go to docs/brand/.`);
-console.log(c.d(`\nInstalled files are recorded in .ds-base.json. Re-run the installer to update; your token is never stored.`));
-rl.close();
+console.log(c.d(`\nInstalled files are recorded in .ds-base.json. Re-run the installer to update or add products; your password or token is never stored.`));
+rl?.close();
