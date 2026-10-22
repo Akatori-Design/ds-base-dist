@@ -19,7 +19,7 @@ curl -fsSL https://raw.githubusercontent.com/Akatori-Design/ds-base-dist/main/in
 ```
 Already installed products are kept and updated; you're only asked about the rest. Useful flags: `--products ds,ux,brand,kit` (adds to what's installed) · `--all` · `--dry-run` (show changes, write nothing) · `--force` (overwrite files that differ) · `--dir src`. Rerun the same command to update.
 
-**Safety:** existing files are never overwritten without `--force`. `CLAUDE.md` changes stay between `<!-- ds-base:start/end -->` markers. `.ds-base.json` records what was installed. The password is never stored.
+**Safety:** nothing you changed is overwritten or deleted. On update, your edits and ds-base's changes merge. A file that can't be merged is left untouched, with the new version saved beside it as `<file>.ds-base-update` (merge it, then delete that file). An installed DS base kit is only updated when you say yes (or pass `--update-kit`). `--force` overwrites, but saves your version as `<file>.ds-base-backup`. Commit `.ds-base/` so merges work for your whole team. Your own rules go in `docs/agents/local-rules.md` (L-###), which updates never touch. `CLAUDE.md` changes stay between `<!-- ds-base:start/end -->` markers. `.ds-base.json` records what was installed. The password is never stored.
 
 ## For Claude: installing ds-base
 When asked to install ds-base, or given this repo's link, inside a project, follow these steps in order:
@@ -34,6 +34,7 @@ When asked to install ds-base, or given this repo's link, inside a project, foll
      - "Install everything?" with **Install all** / **Choose products**;
      - "Which products?" with the four checkboxes, used only if they choose.
    - **Never** offer fewer products, preset combinations or yes/no buttons instead.
+   - **DS base kit already installed:** ask separately, "Update the DS base kit's tokens and components too?", with **No** as the default. Add `--update-kit` only on an explicit yes. Without it, the kit is never touched.
    - Mention the recommendation: DS Designer + DS base kit for a new project, DS Designer alone for a project with its own design system.
 3. **Run from the project root:**
    ```bash

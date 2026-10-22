@@ -14,6 +14,7 @@
 //   --products ds,ux,brand,kit   pick products without the question (any combination)
 //   --all                 all four products
 //   --agent               legacy: DS Designer only · --with-ux / --no-ux: legacy add/skip UX Designer
+//   --update-kit          also update the already-installed DS base kit (otherwise asked; default No)
 //   --bundle <url|path>   encrypted bundle to install (default: the public dist repo)
 //   --github              install from the private repo with a GitHub token (owner)
 //   --ref <branch|tag>    version to install with --github (default: main)
@@ -23,10 +24,11 @@
 //   --force               overwrite files that differ (default: keep yours, report them)
 //   --dry-run             show what would change, write nothing
 //   --yes                 accept defaults (install dependencies, add scripts)
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline";
-import { createDecipheriv, scryptSync } from "node:crypto";
+import { createDecipheriv, createHash, scryptSync } from "node:crypto";
 import { gunzipSync } from "node:zlib";
 import { execSync } from "node:child_process";
 
@@ -251,7 +253,7 @@ async function chooseProducts() {
   if (flag("agent")) return withInstalled(["ds", ...(flag("with-ux") ? ["ux"] : [])]); // legacy flags
 
   const remaining = IDS.filter((id) => !installed.has(id));
-  if (installed.size) console.log(`\n${c.b("Installed here:")} ${[...installed].map((id) => PRODUCTS[id].name).join(", ")} ${c.d("— these will be updated")}`);
+  if (installed.size) console.log(`\n${c.b("Installed here:")} ${[...installed].map((id) => PRODUCTS[id].name).join(", ")} ${c.d(installed.has("kit") ? "— agents update; the kit only if you say so" : "— these will be updated")}`);
   if (!remaining.length) { console.log(c.d("Every product is already installed.")); return installed; }
 
   console.log(`\n${c.b(installed.size ? "Add more products?" : "What do you want to install?")} ${c.d("(any combination)")}`);
@@ -274,20 +276,68 @@ async function chooseProducts() {
 
 // ---- plan & write ------------------------------------------------------------------------
 const plan = []; // { to, content, kind }
-const results = { created: [], updated: [], same: [], kept: [] };
+const results = { created: [], updated: [], same: [], kept: [], merged: [], conflicts: [], backups: [] };
 
 function stage(to, content, kind = "file") { plan.push({ to, content, kind }); }
+
+// ---- three-way update (T-045) -------------------------------------------------------------
+// base = what ds-base last installed for this file. With it, a client's edits and ds-base's
+// changes merge; without a clean merge the client's file is never touched.
+//   .ds-base/base/<path>      base copy written on every install/update
+//   <path>.ds-base-update     new version saved beside a file that couldn't be merged
+//   .ds-base/pending/<path>   that new version; once the client deletes the .ds-base-update
+//                             file (= merged), it becomes the base.
+const BASE_DIR = ".ds-base/base", PENDING_DIR = ".ds-base/pending";
+const SIDE = ".ds-base-update", BACKUP = ".ds-base-backup";
+let prevLock = null;
+try { prevLock = JSON.parse(readFileSync(join(HOST, ".ds-base.json"), "utf8")); } catch { /* first install */ }
+
+const readIf = (p) => (existsSync(p) ? readFileSync(p, "utf8") : null);
+const writeAt = (p, text) => { if (DRY) return; mkdirSync(dirname(p), { recursive: true }); writeFileSync(p, text); };
+const removeAt = (p) => { if (!DRY && existsSync(p)) rmSync(p); };
+
+function merge3(current, base, incoming) {
+  const dir = join(tmpdir(), `ds-base-merge-${process.pid}-${Math.random().toString(36).slice(2)}`);
+  mkdirSync(dir, { recursive: true });
+  const [a, o, b] = ["current", "base", "incoming"].map((n) => join(dir, n));
+  writeFileSync(a, current); writeFileSync(o, base); writeFileSync(b, incoming);
+  try {
+    return { ok: true, text: execSync(`git merge-file -p "${a}" "${o}" "${b}"`, { stdio: ["ignore", "pipe", "ignore"] }).toString() };
+  } catch (e) {
+    return { ok: false }; // conflicts (exit > 0) or git missing
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
 
 function apply() {
   for (const { to, content, kind } of plan) {
     const abs = join(HOST, to);
     const exists = existsSync(abs);
     const current = exists ? readFileSync(abs, "utf8") : null;
-    if (exists && current === content) { results.same.push(to); continue; }
-    if (exists && kind === "ifMissing") { results.same.push(to); continue; }
-    if (exists && kind !== "managed" && !FORCE) { results.kept.push(to); continue; }
-    if (!DRY) { mkdirSync(dirname(abs), { recursive: true }); writeFileSync(abs, content); }
-    (exists ? results.updated : results.created).push(to);
+    if (kind === "ifMissing") { if (!exists) writeAt(abs, content); (exists ? results.same : results.created).push(to); continue; }
+    if (kind === "managed") {
+      if (current === content) { results.same.push(to); continue; }
+      writeAt(abs, content); (exists ? results.updated : results.created).push(to); continue;
+    }
+    const basePath = join(HOST, BASE_DIR, to), pendingPath = join(HOST, PENDING_DIR, to), side = abs + SIDE;
+    const setBase = () => writeAt(basePath, content);
+    let base = readIf(basePath);
+    // A previous conflict the client has resolved (deleted the .ds-base-update file) → its version is the base
+    const pending = readIf(pendingPath);
+    if (pending !== null && !existsSync(side)) { base = pending; writeAt(basePath, pending); removeAt(pendingPath); }
+    else if (pending !== null) {
+      // still unresolved: refresh the saved new version and wait
+      if (pending !== content) { writeAt(side, content); writeAt(pendingPath, content); }
+      results.conflicts.push(to); continue;
+    }
+
+    if (!exists) { writeAt(abs, content); setBase(); results.created.push(to); continue; }
+    if (current === content) { setBase(); results.same.push(to); continue; }
+    if (FORCE) { writeAt(abs + BACKUP, current); writeAt(abs, content); setBase(); results.backups.push(to); continue; }
+    if (base !== null && current === base) { writeAt(abs, content); setBase(); results.updated.push(to); continue; }
+    if (base !== null && content === base) { results.kept.push(to); continue; } // only the client changed it
+    const m = base !== null ? merge3(current, base, content) : { ok: false };
+    if (m.ok) { writeAt(abs, m.text); setBase(); results.merged.push(to); continue; }
+    writeAt(side, content); writeAt(pendingPath, content); results.conflicts.push(to);
   }
 }
 
@@ -352,11 +402,25 @@ if (has("ux")) {
 }
 // 3) Brand Designer
 if (has("brand")) for (const p of manifest.brandDesigner.root) stage(p, await source.read(p));
-// Agents without the kit get an empty decision log and product rules (created once)
-if (!has("kit") && (has("ds") || has("ux") || has("brand")))
-  for (const [to, from] of Object.entries(manifest.agentTemplates)) if (!to.startsWith("$")) stage(to, await source.read(from), "ifMissing");
-// 4) DS base kit
-if (has("kit")) {
+// The project's own rules file (L-###), created once and never updated (T-045)
+for (const [to, from] of Object.entries(manifest.hostTemplates ?? {})) if (!to.startsWith("$")) stage(to, await source.read(from), "ifMissing");
+// 4) DS base kit — once installed, it's only updated when the user says so (T-045)
+const kitInstalled = installedProducts().has("kit");
+let updateKit = has("kit");
+if (has("kit") && kitInstalled) {
+  if (flag("update-kit")) updateKit = true;
+  else if (flag("no-update-kit") || YES || !process.stdin.isTTY) updateKit = false;
+  else {
+    console.log(`\n${c.b("The DS base kit is already installed.")} ${c.d("Updating merges your edits; nothing is overwritten.")}`);
+    updateKit = /^y/i.test(await ask("Update its tokens and components too? [y/N]: ", "n"));
+  }
+}
+const kitPaths = async () => [
+  ...manifest.kit.root, ...(manifest.kit.ifMissing ?? []), ...manifest.kit.code.map(codePath),
+  ...(await listFiles()).filter((f) => manifest.kit.codeDirs.some((d) => f.startsWith(d + "/")) && !skipStories.test(f)).map(codePath),
+];
+const keptKitFiles = has("kit") && !updateKit ? await kitPaths() : []; // still installed, just not touched
+if (updateKit) {
   const tw = allDeps.tailwindcss;
   if (!tw) console.log(c.y("! tailwindcss not found in package.json — the DS base kit needs Tailwind CSS v4."));
   else if (!/^[\^~]?4|^latest|^next/.test(tw)) console.log(c.y(`! tailwindcss ${tw} detected — ds-base tokens require v4 (@theme, @utility).`));
@@ -375,23 +439,62 @@ if (has("brand")) claudeParts.push(await source.read(manifest.brandDesigner.clau
 // How to update / add products — Claude reads this block in every session of the host project
 const names = (ids) => ids.map((id) => PRODUCTS[id].name).join(", ");
 const missingIds = IDS.filter((id) => !has(id));
-if (manifest.updateSnippet)
-  claudeParts.push((await source.read(manifest.updateSnippet)).replace("{{installed}}", names(IDS.filter(has))).replace("{{missing}}", missingIds.length ? names(missingIds) : "nothing — all four are installed"));
+if (manifest.rulesSnippet)
+  claudeParts.push((await source.read(manifest.rulesSnippet)).replace("{{installed}}", names(IDS.filter(has))).replace("{{missing}}", missingIds.length ? names(missingIds) : "nothing — all four are installed"));
 stage("CLAUDE.md", claudeBlock(claudeParts.join("\n")), "managed");
 
 apply();
+
+// ---- rules you override that changed upstream (T-045) --------------------------------------
+// Fingerprints every ds-base rule (T-/P- entries, agent and playbook sections) into
+// .ds-base/rules.json; on update, L-rules whose Overrides: point at a changed rule are reported.
+const RULES = ".ds-base/rules.json";
+const hash = (t) => createHash("sha256").update(t.trim()).digest("hex").slice(0, 16);
+async function ruleFingerprints() {
+  const out = {};
+  const files = await listFiles();
+  const read = async (p) => (files.includes(p) ? await source.read(p) : "");
+  for (const p of ["tokens/DECISIONS.md", "docs/PRODUCT_RULES.md"])
+    for (const part of (await read(p)).split(/\n(?=## [TP]-\d+)/)) { const id = part.match(/^## ([TP]-\d+)/)?.[1]; if (id) out[id.toLowerCase()] = hash(part); }
+  for (const p of files.filter((f) => /^\.claude\/agents\/[^/]+\.md$/.test(f) || f === "docs/agents/ds-playbook.md")) {
+    const doc = p.split("/").pop().replace(/\.md$/, "");
+    for (const part of (await read(p)).split(/\n(?=## )/)) { const h = part.match(/^## (.+)/)?.[1]; if (h) out[`${doc}#${h.trim()}`.toLowerCase()] = hash(part); }
+  }
+  return out;
+}
+const overrideNotes = [];
+{
+  const now = await ruleFingerprints();
+  let before = null;
+  try { before = JSON.parse(readFileSync(join(HOST, RULES), "utf8")); } catch { /* first run */ }
+  const local = (() => { try { return readFileSync(join(HOST, "docs/agents/local-rules.md"), "utf8"); } catch { return ""; } })();
+  if (before) for (const block of local.split(/\n(?=## L-\d+)/)) {
+    const id = block.match(/^## (L-\d+)/)?.[1];
+    const refs = (block.match(/\*{0,2}Overrides:\*{0,2}\s*(.+)/)?.[1] ?? "").split(",").map((r) => r.trim().replace(/`/g, "")).filter((r) => r && !/^none$/i.test(r));
+    if (!id) continue;
+    for (const ref of refs) {
+      const key = ref.toLowerCase();
+      const keys = Object.keys(before).filter((k) => k === key || k.startsWith(key)); // "ds-playbook#§4" matches "ds-playbook#§4 standard ux patterns"
+      if (!keys.length) continue;
+      const removed = keys.filter((k) => !(k in now)), changed = keys.filter((k) => k in now && now[k] !== before[k]);
+      if (removed.length) overrideNotes.push(`${id} overrides ${ref}, which ds-base removed. Review: is ${id} still needed?`);
+      else if (changed.length) overrideNotes.push(`${id} overrides ${ref}, which changed upstream. Your rule still applies. Review: keep, update or drop ${id}.`);
+    }
+  }
+  writeAt(join(HOST, RULES), JSON.stringify(now, null, 1) + "\n");
+}
 
 // Files from the previous install that ds-base no longer ships (moved/removed upstream).
 // Never deleted automatically — reported so the user can review and remove them.
 let orphans = [];
 try {
   const prev = JSON.parse(readFileSync(join(HOST, ".ds-base.json"), "utf8"));
-  const now = new Set(plan.map((p) => p.to));
+  const now = new Set([...plan.map((p) => p.to), ...keptKitFiles]);
   orphans = (prev.files ?? []).filter((f) => !now.has(f) && existsSync(join(HOST, f)));
 } catch { /* first install */ }
 
 // Lock file — records what was installed (no secrets)
-const lock = { repo: MODE === "local" ? "local" : MODE === "bundle" ? "bundle" : REPO, ref: MODE === "github" ? REF : undefined, version, products: IDS.filter(has), mode, base, installedAt: new Date().toISOString(), files: plan.map((p) => p.to) };
+const lock = { repo: MODE === "local" ? "local" : MODE === "bundle" ? "bundle" : REPO, ref: MODE === "github" ? REF : undefined, version, products: IDS.filter(has), mode, base, installedAt: new Date().toISOString(), files: [...new Set([...plan.map((p) => p.to), ...keptKitFiles])], baseDir: BASE_DIR };
 if (!DRY) writeFileSync(join(HOST, ".ds-base.json"), JSON.stringify(lock, null, 2) + "\n");
 
 // ---- report ------------------------------------------------------------------------------
@@ -400,25 +503,37 @@ console.log(`\n${c.b(DRY ? "Dry run — nothing written" : "Done")}  ${c.d(`${ID
 line("created", results.created, c.g);
 line("updated", results.updated, c.g);
 line("unchanged", results.same, c.d);
-line("kept yours", results.kept, c.y);
+line("merged", results.merged, c.g);
+line("yours", results.kept, c.d);
+line("backed up", results.backups, c.y);
+line("to merge", results.conflicts, c.y);
 if (orphans.length) {
   console.log(c.y(`  ${orphans.length} file(s) from your previous install aren't part of this install (product not chosen, or moved/removed upstream) — left in place:`));
   for (const f of orphans) console.log(c.y(`    ${f}`));
   console.log(c.y(`  Delete them once nothing imports them.`));
 }
-if (results.kept.length) {
-  console.log(c.y(`  ${results.kept.length} existing file(s) differ and were left as-is. Re-run with --force to overwrite (review with git diff after).`));
-  // Warn when installed files import a file the user kept — its API may not match.
-  for (const kept of results.kept) {
+if (overrideNotes.length) {
+  console.log(c.y(`  Rules you override changed upstream (docs/agents/local-rules.md):`));
+  for (const n of overrideNotes) console.log(c.y(`    ${n}`));
+}
+if (results.merged.length) console.log(c.g(`  ${results.merged.length} file(s) had your edits and ds-base changes merged automatically. Review with git diff.`));
+if (results.backups.length) console.log(c.y(`  --force overwrote ${results.backups.length} edited file(s); your versions are saved beside them as *${BACKUP}.`));
+if (results.conflicts.length) {
+  console.log(c.y(`  ${results.conflicts.length} file(s) couldn't be merged automatically and were left untouched. The new version is saved beside each:`));
+  for (const f of results.conflicts) console.log(c.y(`    ${f}${SIDE}`));
+  console.log(c.y(`  Merge what you want from it, then delete the ${SIDE} file. The next update treats it as merged.`));
+  // Warn when an installed file imports one that's waiting to be merged — its API may not match.
+  for (const kept of results.conflicts) {
     const name = kept.replace(/\.(tsx?|mjs)$/, "").split("/").pop();
     const users = plan.filter((p) => p.to !== kept && /\.(tsx?)$/.test(p.to) && new RegExp(`from ["'](\\./|@/components/ui/)${name}["']`).test(p.content)).map((p) => p.to.split("/").pop());
-    if (users.length) console.log(c.y(`  ! ${users.join(", ")} import ${kept} — your version is kept, so check it exposes the same API (or use --force).`));
+    if (users.length) console.log(c.y(`  ! ${users.join(", ")} import ${kept}, which is waiting to be merged — check its API matches.`));
   }
 }
 
 // Dependencies (kit and/or UX tools) & scripts (kit only)
-const wantDeps = [...(has("kit") ? manifest.kit.dependencies : []), ...(has("ux") ? manifest.uxDesigner.dependencies ?? [] : [])];
-const wantDev = has("kit") ? manifest.kit.devDependencies : [];
+if (keptKitFiles.length) console.log(c.d(`  DS base kit left as-is (tokens and components untouched). Update it with --update-kit.`));
+const wantDeps = [...(updateKit ? manifest.kit.dependencies : []), ...(has("ux") ? manifest.uxDesigner.dependencies ?? [] : [])];
+const wantDev = updateKit ? manifest.kit.devDependencies : [];
 if ((wantDeps.length || wantDev.length) && !DRY) {
   // Entries may be "name@range" (e.g. "@tanstack/react-table@^8"); presence is checked by name.
   const depName = (d) => d.replace(/^(@?[^@]+)@.*$/, "$1");
@@ -446,7 +561,7 @@ if ((wantDeps.length || wantDev.length) && !DRY) {
     else console.log(`Run later:\n  ${cmds.join("\n  ")}`);
   }
 }
-if (has("kit") && !DRY) {
+if (updateKit && !DRY) {
   const pkg = JSON.parse(readFileSync(hostPkgPath, "utf8"));
   pkg.scripts ??= {};
   let added = 0;
@@ -456,7 +571,7 @@ if (has("kit") && !DRY) {
 
 // Next steps
 console.log(`\n${c.b("Next")}`);
-if (has("kit")) {
+if (updateKit && !kitInstalled) {
   const cssRel = base === "." ? "tokens/tokens.css" : `${relative(base, ".")}/tokens/tokens.css`;
   console.log(`  • In your global CSS, replace ${c.b('@import "tailwindcss";')} with:\n       @import "${cssRel.startsWith(".") ? cssRel : "./" + cssRel}";  ${c.d("(adjust the path from your CSS file)")}\n       @import "${(cssRel.startsWith(".") ? cssRel : "./" + cssRel).replace("tokens.css", "themes.css")}";`);
   console.log(`    and remove shadcn's default :root/.dark color variables there — ds-base tokens replace them.`);
