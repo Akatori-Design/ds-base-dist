@@ -372,6 +372,11 @@ if (has("kit")) claudeParts.push(extractClaudeSections(await source.read(manifes
 else if (has("ds")) claudeParts.push(await source.read(manifest.dsDesigner.claudeSnippet));
 if (has("ux")) claudeParts.push(await source.read(manifest.uxDesigner.claudeSnippet));
 if (has("brand")) claudeParts.push(await source.read(manifest.brandDesigner.claudeSnippet));
+// How to update / add products — Claude reads this block in every session of the host project
+const names = (ids) => ids.map((id) => PRODUCTS[id].name).join(", ");
+const missingIds = IDS.filter((id) => !has(id));
+if (manifest.updateSnippet)
+  claudeParts.push((await source.read(manifest.updateSnippet)).replace("{{installed}}", names(IDS.filter(has))).replace("{{missing}}", missingIds.length ? names(missingIds) : "nothing — all four are installed"));
 stage("CLAUDE.md", claudeBlock(claudeParts.join("\n")), "managed");
 
 apply();
@@ -464,6 +469,7 @@ if (has("ux")) {
   console.log(`  • UX work: ask for the ${c.b("ux-designer")} agent ("design the onboarding flow"). Specs go to docs/ux/.`);
   console.log(`  • Mount ${c.b("<DevControls />")} once at the app root (components/ux-tools, dev builds only).`);
 }
+if (missingIds.length) console.log(`  • ${c.b("Not installed yet:")} ${names(missingIds)}. Rerun the installer and pick them, or add ${c.b(`--products ${missingIds.join(",")}`)}.`);
 if (has("brand")) console.log(`  • Brand work: ask for the ${c.b("brand-designer")} agent ("define our brand look from these references"). Profiles go to docs/brand/.`);
 console.log(c.d(`\nInstalled files are recorded in .ds-base.json. Re-run the installer to update or add products; your password or token is never stored.`));
 rl?.close();
