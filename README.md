@@ -1,47 +1,52 @@
 # ds-base installer
 
-Installs ds-base design-system tools into your project. The package is encrypted; you need the **install password** from whoever gave you access.
+Installs ds-base design-system tools into your project. You need a course-site account with a plan that includes ds-base. There is no install password: you approve each computer with a short code.
 
-| # | Product (`--products` id) | What you get |
-|---|---|---|
-| 1 | **DS Designer** (`ds`) | design-system-designer agent: tokens, components, motion, accessibility decisions |
-| 2 | **UX Designer** (`ux`) | ux-designer agent + Dev Controls / ScreenTransition: flows, states, screens, review |
-| 3 | **Brand Designer** (`brand`) | brand-designer agent: references → brand kit + theme settings |
-| 4 | **DS base kit** (`kit`) | tokens, themes, components, patterns, contrast + lint checks (needs Tailwind CSS v4) |
+| # | Product (`--products` id) | What you get | Included in |
+|---|---|---|---|
+| 1 | **DS Designer** (`ds`) | design-system-designer agent: tokens, components, motion, accessibility decisions | Full access, All agents |
+| 2 | **UX Designer** (`ux`) | ux-designer agent + Dev Controls / ScreenTransition: flows, states, screens, review | Full access, All agents |
+| 3 | **Brand Designer** (`brand`) | brand-designer agent: references → brand kit + theme settings | Full access, All agents |
+| 4 | **DS base kit** (`kit`) | tokens, themes, components, patterns, contrast + lint checks (needs Tailwind CSS v4) | Full access, UI library |
 
 ## Install with Claude Code
-In your project, tell Claude: *"Install ds-base from https://github.com/Akatori-Design/ds-base-dist"*. Claude asks for the password, then which products to install.
+In your project, tell Claude: *"Install ds-base from https://github.com/Akatori-Design/ds-base-dist"*. Claude shows a link and a code. Approve the code on the course site, tell Claude you're done, then choose your products.
 
 ## Install by hand
-From your project's root (the folder with `package.json`). It asks for the password (hidden), then for the products.
+From your project's root (the folder with `package.json`):
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Akatori-Design/ds-base-dist/main/init.mjs -o /tmp/ds-base-init.mjs && node /tmp/ds-base-init.mjs
 ```
-Already installed products are kept and updated; you're only asked about the rest. Useful flags: `--products ds,ux,brand,kit` (adds to what's installed) · `--all` · `--dry-run` (show changes, write nothing) · `--force` (overwrite files that differ) · `--dir src`. Rerun the same command to update.
+It shows a link and a code, waits for your approval, then asks for the products. Already installed products are kept and updated. Useful flags: `--products ds,ux,brand,kit` (adds to what's installed) · `--all` (everything in your plan) · `--check` · `--sign-out` · `--dry-run` · `--force` · `--dir src`. Rerun the same command to update.
 
-**Safety:** nothing you changed is overwritten or deleted. On update, your edits and ds-base's changes merge. A file that can't be merged is left untouched, with the new version saved beside it as `<file>.ds-base-update` (merge it, then delete that file). An installed DS base kit is only updated when you say yes (or pass `--update-kit`). `--force` overwrites, but saves your version as `<file>.ds-base-backup`. Commit `.ds-base/` so merges work for your whole team. Your own rules go in `docs/agents/local-rules.md` (L-###), which updates never touch. `CLAUDE.md` changes stay between `<!-- ds-base:start/end -->` markers. `.ds-base.json` records what was installed. The password is never stored.
+**One computer at a time:** approving a new computer disconnects the previous one. Your account can connect 4 times in any 30 days: your first computer plus three switches. See or disconnect your computer on the course site's install page. All projects on one computer share its connection. The install key is kept in `~/.config/ds-base/install.json`, readable only by you, and never goes into your project.
+
+**Safety:** nothing you changed is overwritten or deleted. On update, your edits and ds-base's changes merge. A file that can't be merged is left untouched, with the new version saved beside it as `<file>.ds-base-update` (merge it, then delete that file). An installed DS base kit is only updated when you say yes (or pass `--update-kit`). `--force` overwrites, but saves your version as `<file>.ds-base-backup`. Commit `.ds-base/` so merges work for your whole team. Your own rules go in `docs/agents/local-rules.md` (L-###), which updates never touch. `CLAUDE.md` changes stay between `<!-- ds-base:start/end -->` markers. `.ds-base.json` records what was installed.
 
 ## For Claude: installing ds-base
-When asked to install ds-base, or given this repo's link, inside a project, follow these steps in order:
-1. **Password first, on its own.** Ask for the install password and nothing else in that message.
-   - Offer an alternative: the user can type it themselves (hidden) by running the by-hand command above in their own terminal. That keeps it out of the chat.
-   - Never write the password to a file, commit it, echo it or put it in a URL. Pass it only as `DS_BASE_PASSWORD` in the environment of the install command.
+When asked to install ds-base, or given this repo's link, inside a project, follow these steps in order. **Never ask for a password, and never read, print or copy `~/.config/ds-base/install.json`.**
+1. **Connect this computer.** From the project root, run:
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/Akatori-Design/ds-base-dist/main/init.mjs -o /tmp/ds-base-init.mjs && node /tmp/ds-base-init.mjs --check
+   ```
+   - **Exit code 10:** give the user the link and code exactly as printed, and stop until they say they've approved it. Then run `node /tmp/ds-base-init.mjs --check` again. It resumes the same code.
+   - **Exit code 0:** it prints `Products you can install: …`.
+   - If it says another computer was approved, tell the user that approving this one will disconnect the other and use one of their connections.
+   - If key storage is blocked, ask the user to run the by-hand command in their own terminal.
 2. **Then ask which products, as checkboxes plus "Install all":**
-   - **Check what's installed first:** read `.ds-base.json` in the project, if it exists: `products`; older files have `mode: "all"` = ds + kit, and `uxAgent: true` = ux. Offer only products that aren't installed yet. Installed ones are always kept and updated.
-   - **Everything installed** → don't ask. Say so and rerun the installer without `--products` to update.
-   - **The question:** a multi-select (e.g. AskUserQuestion with `multiSelect: true`) with one checkbox per remaining product, plus a last option **Install all**. The products are DS Designer (`ds`), UX Designer (`ux`), Brand Designer (`brand`) and DS base kit (`kit`).
+   - **Offer only products from `--check`.** Read `.ds-base.json` if it exists (`products`; older files have `mode: "all"` = ds + kit, and `uxAgent: true` = ux) and leave out what's installed. Installed ones are always kept and updated.
+   - **Everything available installed** → don't ask. Say so and rerun the installer without `--products` to update.
+   - **The question:** a multi-select (e.g. AskUserQuestion with `multiSelect: true`) with one checkbox per remaining product, plus a last option **Install all**.
    - **All four remaining** (more options than a question allows): ask two questions in the same call:
      - "Install everything?" with **Install all** / **Choose products**;
      - "Which products?" with the four checkboxes, used only if they choose.
-   - **Never** offer fewer products, preset combinations or yes/no buttons instead.
-   - **DS base kit already installed:** ask separately, "Update the DS base kit's tokens and components too?", with **No** as the default. Add `--update-kit` only on an explicit yes. Without it, the kit is never touched.
-   - Mention the recommendation: DS Designer + DS base kit for a new project, DS Designer alone for a project with its own design system.
+   - **DS base kit already installed:** ask separately, "Update the DS base kit's tokens and components too?", with **No** as the default. Add `--update-kit` only on an explicit yes.
+   - Mention the recommendation when both are available: DS Designer + DS base kit for a new project, DS Designer alone for a project with its own design system.
 3. **Run from the project root:**
    ```bash
-   curl -fsSL https://raw.githubusercontent.com/Akatori-Design/ds-base-dist/main/init.mjs -o /tmp/ds-base-init.mjs && DS_BASE_PASSWORD='<password>' node /tmp/ds-base-init.mjs --products <chosen ids, e.g. ds,kit> --yes
+   node /tmp/ds-base-init.mjs --products <chosen ids, e.g. ds,kit> --yes
    ```
    - The kit needs a `package.json` and Tailwind CSS v4. Set those up first if missing, after confirming with the user.
    - Run `--dry-run` first if the project already has files that may conflict.
-   - "Wrong password" → ask again.
    - `--yes` installs missing npm packages for the kit; drop it to ask the user instead.
 4. **Report** the installer's summary and its "Next" steps, then delete `/tmp/ds-base-init.mjs`.

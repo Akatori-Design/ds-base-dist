@@ -3,19 +3,21 @@
 // directory: 1) DS Designer  2) UX Designer  3) Brand Designer  (agents)  4) DS base kit.
 // Zero dependencies (Node 18+).
 //
-// Clients: install from the public dist repo with a password (no repo access, T-043).
+// Buyers: approve this computer on the course site, then install what they bought (T-050).
 //   curl -fsSL https://raw.githubusercontent.com/Akatori-Design/ds-base-dist/main/init.mjs -o /tmp/ds-base-init.mjs
-//   node /tmp/ds-base-init.mjs            # asks for the password (hidden), then which products
-// Password from DS_BASE_PASSWORD or the hidden prompt; never stored or printed.
+//   node /tmp/ds-base-init.mjs            # shows a code to approve, then asks which products
+// The install key stays in ~/.config/ds-base (owner-only) and is never printed.
 //
 // Owner: install straight from the private repo with DS_BASE_TOKEN (or --github to be asked for it).
 //
 // Options:
 //   --products ds,ux,brand,kit   pick products without the question (any combination)
-//   --all                 all four products
+//   --all                 every product your account includes
+//   --check               sign in if needed, list the products you can install, and stop
+//   --sign-out            remove this computer's install key
 //   --agent               legacy: DS Designer only · --with-ux / --no-ux: legacy add/skip UX Designer
 //   --update-kit          also update the already-installed DS base kit (otherwise asked; default No)
-//   --bundle <url|path>   encrypted bundle to install (default: the public dist repo)
+//   --site <url>          course site to sign in to (default: set when published)
 //   --github              install from the private repo with a GitHub token (owner)
 //   --ref <branch|tag>    version to install with --github (default: main)
 //   --repo <owner/name>   default: Akatori-Design/ds-base
@@ -24,11 +26,11 @@
 //   --force               overwrite files that differ (default: keep yours, report them)
 //   --dry-run             show what would change, write nothing
 //   --yes                 accept defaults (install dependencies, add scripts)
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, hostname, platform, tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline";
-import { createDecipheriv, createHash, scryptSync } from "node:crypto";
+import { createHash } from "node:crypto";
 import { gunzipSync } from "node:zlib";
 import { execSync } from "node:child_process";
 
@@ -42,9 +44,9 @@ const SOURCE = opt("source");
 const FORCE = flag("force"), DRY = flag("dry-run"), YES = flag("yes");
 const HOST = process.cwd();
 let TOKEN = process.env.DS_BASE_TOKEN;
-let PASSWORD = process.env.DS_BASE_PASSWORD;
-const BUNDLE = opt("bundle", "https://raw.githubusercontent.com/Akatori-Design/ds-base-dist/main/ds-base.bundle");
-const MODE = SOURCE ? "local" : TOKEN || flag("github") ? "github" : "bundle";
+const SITE = (opt("site") || process.env.DS_BASE_SITE || "https://no-figma-design.pages.dev").replace(/\/+$/, ""); // filled in by install/publish.mjs
+const MODE = SOURCE ? "local" : TOKEN || flag("github") ? "github" : "account";
+const NEEDS_APPROVAL = 10; // exit code: show the code to the buyer, then run this again
 
 const c = { b: (s) => `\x1b[1m${s}\x1b[0m`, g: (s) => `\x1b[32m${s}\x1b[0m`, y: (s) => `\x1b[33m${s}\x1b[0m`, r: (s) => `\x1b[31m${s}\x1b[0m`, d: (s) => `\x1b[2m${s}\x1b[0m` };
 const die = (msg) => { console.error(c.r(`✗ ${msg}`)); process.exit(1); };
@@ -60,33 +62,106 @@ const gh = async (path, accept = "application/vnd.github+json") => {
   return res;
 };
 
-// Encrypted bundle: "DSB1" | salt(16) | iv(12) | tag(16) | ciphertext (built by install/publish.mjs)
-let bundleData = null;
-async function loadBundle() {
-  if (bundleData) return bundleData;
-  let raw;
-  if (/^https?:/.test(BUNDLE)) {
-    const res = await fetch(BUNDLE, { headers: { "User-Agent": "ds-base-init" } });
-    if (!res.ok) die(`Couldn't download the install bundle (${res.status}) from ${BUNDLE}.`);
-    raw = Buffer.from(await res.arrayBuffer());
-  } else raw = readFileSync(BUNDLE);
-  if (raw.subarray(0, 4).toString() !== "DSB1") die("That file isn't a ds-base bundle.");
-  const salt = raw.subarray(4, 20), iv = raw.subarray(20, 32), tag = raw.subarray(32, 48);
-  const key = scryptSync(PASSWORD, salt, 32, { N: 2 ** 15, r: 8, p: 1, maxmem: 64 * 1024 * 1024 });
+// ---- account install: one approved computer per buyer (T-050) -----------------------------
+const CONFIG_DIR = join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "ds-base");
+const CONFIG_FILE = join(CONFIG_DIR, "install.json");
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const readConfig = () => { try { return JSON.parse(readFileSync(CONFIG_FILE, "utf8")); } catch { return {}; } };
+const siteEntry = () => readConfig()[SITE] ?? {};
+function saveEntry(entry) {
+  const all = readConfig();
+  if (Object.keys(entry).length) all[SITE] = entry; else delete all[SITE];
   try {
-    const d = createDecipheriv("aes-256-gcm", key, iv);
-    d.setAuthTag(tag);
-    bundleData = JSON.parse(gunzipSync(Buffer.concat([d.update(raw.subarray(48)), d.final()])).toString("utf8"));
-  } catch { die("Wrong password (or a damaged bundle)."); }
-  return bundleData;
+    mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+    writeFileSync(CONFIG_FILE, JSON.stringify(all, null, 2) + "\n", { mode: 0o600 });
+    chmodSync(CONFIG_FILE, 0o600);
+  } catch (e) { die(`Couldn't save the install key in ${CONFIG_DIR} (${e.code ?? e.message}). Run the installer in your own terminal.`); }
+}
+function checkSite() {
+  let url;
+  try { url = new URL(SITE); } catch { die("This installer has no course site set. Download the latest one from ds-base-dist."); }
+  if (url.protocol !== "https:" && !["localhost", "127.0.0.1"].includes(url.hostname)) die("The course site must use https.");
+}
+async function call(path, init = {}) {
+  try { return await fetch(`${SITE}/api/install/${path}`, { ...init, headers: { "user-agent": "ds-base-init", ...(init.body ? { "content-type": "application/json" } : {}), ...init.headers } }); }
+  catch { die(`Couldn't reach ${SITE}. Check your connection and try again.`); }
+}
+const errorOf = async (res) => (await res.json().catch(() => ({}))).error;
+const showApproval = (p) => {
+  console.log(`\n${c.b("Approve this computer")}`);
+  console.log(`  1. Open   ${c.b(p.verification_url)}`);
+  console.log(`  2. Sign in and enter this code:  ${c.b(p.user_code)}`);
+  console.log(c.d("  Only enter a code you started yourself. It expires in 10 minutes.\n"));
+};
+async function startApproval() {
+  const res = await call("start", { method: "POST", body: JSON.stringify({ label: `${hostname()} (${{ darwin: "Mac", win32: "Windows", linux: "Linux" }[platform()] ?? platform()})` }) });
+  if (!res.ok) die(res.status === 429 ? "Too many install attempts from this network. Try again in an hour." : `The course site couldn't start the install (${res.status}).`);
+  const d = await res.json();
+  const pending = { device_code: d.device_code, user_code: d.user_code, verification_url: d.verification_url, interval: d.interval, expires_at: Date.now() + d.expires_in * 1000 };
+  saveEntry({ pending });
+  return pending;
+}
+// Waits for approval. In a terminal it waits for the buyer; elsewhere (Claude) it checks briefly
+// and exits so the code can be shown to them, and the next run picks up where this one stopped.
+async function waitForKey() {
+  let pending = siteEntry().pending;
+  let resumed = !!pending && pending.expires_at > Date.now();
+  if (!resumed) pending = await startApproval();
+  showApproval(pending);
+  const interactive = process.stdin.isTTY && !YES;
+  const until = interactive ? pending.expires_at : resumed ? Math.min(pending.expires_at, Date.now() + 20000) : 0;
+  if (interactive) console.log(c.d("Waiting for approval…"));
+  while (Date.now() < until || resumed) {
+    resumed = false;
+    const res = await call("poll", { method: "POST", body: JSON.stringify({ device_code: pending.device_code }) });
+    if (res.status === 200) {
+      const d = await res.json();
+      if (d.status === "approved") { saveEntry({ key: d.install_key }); console.log(c.g("✓ Computer approved.")); return d.install_key; }
+    } else {
+      const error = await errorOf(res);
+      saveEntry({});
+      if (error === "connection_limit") die("This account has used its connections for the last 30 days. Contact support for a reset.");
+      if (error === "plan_required") die("Your plan doesn't include ds-base.");
+      die("That code expired. Run the installer again for a new one.");
+    }
+    if (Date.now() + pending.interval * 1000 >= until) break;
+    await sleep(pending.interval * 1000);
+  }
+  if (interactive) { saveEntry({}); die("The code expired. Run the installer again for a new one."); }
+  console.log(`Waiting for approval. After approving, run this same command again.`);
+  process.exit(NEEDS_APPROVAL);
+}
+let packageData = null;
+async function loadPackage() {
+  checkSite();
+  let key = siteEntry().key;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    key ??= await waitForKey();
+    const res = await call("package", { headers: { authorization: `Bearer ${key}` } });
+    if (res.ok) {
+      try { packageData = JSON.parse(gunzipSync(Buffer.from(await res.arrayBuffer())).toString("utf8")); } catch { die("The download was damaged. Please try again."); }
+      return;
+    }
+    const error = await errorOf(res);
+    if (res.status === 401) {
+      saveEntry({}); key = undefined;
+      console.log(c.y(error === "install_replaced" ? "! Another computer was approved for this account, so this one was disconnected." : "! This computer is no longer connected."));
+      if (error === "install_revoked") die("Approve it again on the course site if your plan still includes ds-base.");
+      continue;
+    }
+    if (res.status === 403) die("Your plan doesn't include ds-base.");
+    if (res.status === 429) die("Too many downloads today. Try again tomorrow.");
+    die(`The course site couldn't provide the package (${res.status}). Please try again later.`);
+  }
+  die("This computer couldn't be connected. Please try again.");
 }
 
-const source = MODE === "bundle"
+const source = MODE === "account"
   ? {
-      label: /^https?:/.test(BUNDLE) ? "ds-base install bundle" : `bundle ${resolve(BUNDLE)}`,
-      version: async () => (await loadBundle()).version,
-      list: async () => Object.keys((await loadBundle()).files),
-      read: async (p) => { const f = (await loadBundle()).files[p]; if (f === undefined) die(`Bundle is missing ${p}.`); return f; },
+      label: "your ds-base purchase",
+      version: async () => packageData.version,
+      list: async () => Object.keys(packageData.files),
+      read: async (p) => { const f = packageData.files[p]; if (f === undefined) die(`The package is missing ${p}.`); return f; },
     }
   : SOURCE
   ? {
@@ -129,13 +204,18 @@ function readHidden(question) {
     stdin.on("data", onData);
   });
 }
-if (MODE === "bundle" && !PASSWORD) {
-  if (!process.stdin.isTTY) die("No password. Set DS_BASE_PASSWORD, or run the installer in a terminal to be asked.");
-  console.log(`${c.b("Install password")} ${c.d("— from whoever gave you access. Input is hidden and never stored.")}`);
-  PASSWORD = await readHidden("Password: ");
-  if (!PASSWORD) die("No password entered.");
+if (flag("sign-out")) {
+  checkSite(); saveEntry({});
+  console.log("✓ This computer's install key was removed. To free the connection, disconnect it on the course site too.");
+  process.exit(0);
 }
-if (MODE === "bundle") await loadBundle(); // check the password before asking anything else
+if (MODE === "account") await loadPackage(); // sign in before asking anything else
+if (flag("check")) {
+  if (MODE !== "account") die("--check is for account installs.");
+  console.log(`Products you can install: ${packageData.products.join(",")}`);
+  console.log(`Version: ${packageData.version.slice(0, 7)}`);
+  process.exit(0);
+}
 if (MODE === "github" && !TOKEN) {
   if (!process.stdin.isTTY) die("DS_BASE_TOKEN is not set. Run: export DS_BASE_TOKEN=github_pat_...  (or use --source <local checkout>)");
   console.log(`${c.b("Access token")} ${c.d("— fine-grained GitHub token with Contents: read-only on " + REPO + ". Input is hidden and never stored.")}`);
@@ -190,6 +270,7 @@ const PRODUCTS = {
   kit: { key: "kit", name: "DS base kit", desc: "tokens, themes, components, patterns, contrast + lint checks (needs Tailwind v4)" },
 };
 const IDS = Object.keys(PRODUCTS);
+const AVAILABLE = MODE === "account" ? IDS.filter((id) => packageData.products.includes(id)) : IDS; // what this account may install
 
 // Products already installed here (from .ds-base.json; older lock files had mode/uxAgent).
 function installedProducts() {
@@ -240,25 +321,30 @@ function checkboxes(items, initial) {
 }
 
 async function chooseProducts() {
-  const installed = installedProducts();
+  const found = installedProducts();
+  const installed = new Set([...found].filter((id) => AVAILABLE.includes(id)));
+  const notOwned = [...found].filter((id) => !installed.has(id));
+  if (notOwned.length) console.log(c.y(`! Not in your plan, so left as is: ${notOwned.map((id) => PRODUCTS[id].name).join(", ")}.`));
   const withInstalled = (picked) => new Set([...installed, ...picked]); // installed products are always kept (and updated)
   const fromFlag = opt("products");
   if (fromFlag) {
     const picked = fromFlag.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
     const bad = picked.filter((x) => !IDS.includes(x));
     if (bad.length) die(`Unknown product(s): ${bad.join(", ")}. Use: ${IDS.join(", ")}`);
+    const unowned = picked.filter((x) => !AVAILABLE.includes(x));
+    if (unowned.length) die(`Not in your plan: ${unowned.map((x) => PRODUCTS[x].name).join(", ")}. You can install: ${AVAILABLE.join(", ")}`);
     return withInstalled(picked);
   }
-  if (flag("all")) return new Set(IDS);
-  if (flag("agent")) return withInstalled(["ds", ...(flag("with-ux") ? ["ux"] : [])]); // legacy flags
+  if (flag("all")) return new Set(AVAILABLE);
+  if (flag("agent")) return withInstalled(["ds", ...(flag("with-ux") ? ["ux"] : [])].filter((id) => AVAILABLE.includes(id))); // legacy flags
 
-  const remaining = IDS.filter((id) => !installed.has(id));
+  const remaining = AVAILABLE.filter((id) => !installed.has(id));
   if (installed.size) console.log(`\n${c.b("Installed here:")} ${[...installed].map((id) => PRODUCTS[id].name).join(", ")} ${c.d(installed.has("kit") ? "— agents update; the kit only if you say so" : "— these will be updated")}`);
   if (!remaining.length) { console.log(c.d("Every product is already installed.")); return installed; }
 
   console.log(`\n${c.b(installed.size ? "Add more products?" : "What do you want to install?")} ${c.d("(any combination)")}`);
   if (process.stdin.isTTY && !YES) {
-    const picked = await checkboxes(remaining.map((id) => ({ id, ...PRODUCTS[id] })), installed.size ? [] : ["ds"]);
+    const picked = await checkboxes(remaining.map((id) => ({ id, ...PRODUCTS[id] })), installed.size || !remaining.includes("ds") ? [] : ["ds"]);
     if (!picked.length && !installed.size) die("Nothing chosen. Select at least one product with Space.");
     return withInstalled(picked);
   }
@@ -438,9 +524,9 @@ if (has("ux")) claudeParts.push(await source.read(manifest.uxDesigner.claudeSnip
 if (has("brand")) claudeParts.push(await source.read(manifest.brandDesigner.claudeSnippet));
 // How to update / add products — Claude reads this block in every session of the host project
 const names = (ids) => ids.map((id) => PRODUCTS[id].name).join(", ");
-const missingIds = IDS.filter((id) => !has(id));
+const missingIds = AVAILABLE.filter((id) => !has(id));
 if (manifest.rulesSnippet)
-  claudeParts.push((await source.read(manifest.rulesSnippet)).replace("{{installed}}", names(IDS.filter(has))).replace("{{missing}}", missingIds.length ? names(missingIds) : "nothing — all four are installed"));
+  claudeParts.push((await source.read(manifest.rulesSnippet)).replace("{{installed}}", names(IDS.filter(has))).replace("{{missing}}", missingIds.length ? names(missingIds) : "nothing — every available product is installed"));
 stage("CLAUDE.md", claudeBlock(claudeParts.join("\n")), "managed");
 
 apply();
@@ -494,7 +580,7 @@ try {
 } catch { /* first install */ }
 
 // Lock file — records what was installed (no secrets)
-const lock = { repo: MODE === "local" ? "local" : MODE === "bundle" ? "bundle" : REPO, ref: MODE === "github" ? REF : undefined, version, products: IDS.filter(has), mode, base, installedAt: new Date().toISOString(), files: [...new Set([...plan.map((p) => p.to), ...keptKitFiles])], baseDir: BASE_DIR };
+const lock = { repo: MODE === "local" ? "local" : MODE === "account" ? "account" : REPO, ref: MODE === "github" ? REF : undefined, version, products: IDS.filter(has), mode, base, installedAt: new Date().toISOString(), files: [...new Set([...plan.map((p) => p.to), ...keptKitFiles])], baseDir: BASE_DIR };
 if (!DRY) writeFileSync(join(HOST, ".ds-base.json"), JSON.stringify(lock, null, 2) + "\n");
 
 // ---- report ------------------------------------------------------------------------------
@@ -575,7 +661,7 @@ if (updateKit && !kitInstalled) {
   const cssRel = base === "." ? "tokens/tokens.css" : `${relative(base, ".")}/tokens/tokens.css`;
   console.log(`  • In your global CSS, replace ${c.b('@import "tailwindcss";')} with:\n       @import "${cssRel.startsWith(".") ? cssRel : "./" + cssRel}";  ${c.d("(adjust the path from your CSS file)")}\n       @import "${(cssRel.startsWith(".") ? cssRel : "./" + cssRel).replace("tokens.css", "themes.css")}";`);
   console.log(`    and remove shadcn's default :root/.dark color variables there — ds-base tokens replace them.`);
-  console.log(`  • Pick a style on <html>, e.g. data-theme="sprint" data-primary="ink" data-surface="layered" data-radius="soft"`);
+  console.log(`  • Pick a style on <html>, e.g. data-theme="sprint" data-primary="ink" data-surface="layered"`);
   console.log(`  • Wrap the app once in <TooltipProvider> (components/ui/tooltip).`);
   console.log(`  • Check: npm run ds:contrast && npm run ds:lint`);
 }
@@ -586,5 +672,5 @@ if (has("ux")) {
 }
 if (missingIds.length) console.log(`  • ${c.b("Not installed yet:")} ${names(missingIds)}. Rerun the installer and pick them, or add ${c.b(`--products ${missingIds.join(",")}`)}.`);
 if (has("brand")) console.log(`  • Brand work: ask for the ${c.b("brand-designer")} agent ("define our brand look from these references"). Profiles go to docs/brand/.`);
-console.log(c.d(`\nInstalled files are recorded in .ds-base.json. Re-run the installer to update or add products; your password or token is never stored.`));
+console.log(c.d(`\nInstalled files are recorded in .ds-base.json. Re-run the installer to update or add products. Nothing secret is stored in this project.`));
 rl?.close();
