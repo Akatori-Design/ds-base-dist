@@ -362,7 +362,7 @@ async function chooseProducts() {
 
 // ---- plan & write ------------------------------------------------------------------------
 const plan = []; // { to, content, kind }
-const results = { created: [], updated: [], same: [], kept: [], merged: [], conflicts: [], backups: [] };
+const results = { created: [], updated: [], same: [], kept: [], merged: [], conflicts: [], backups: [], removed: [] };
 
 function stage(to, content, kind = "file") { plan.push({ to, content, kind }); }
 
@@ -373,6 +373,7 @@ function stage(to, content, kind = "file") { plan.push({ to, content, kind }); }
 //   <path>.ds-base-update     new version saved beside a file that couldn't be merged
 //   .ds-base/pending/<path>   that new version; once the client deletes the .ds-base-update
 //                             file (= merged), it becomes the base.
+// A file the client deleted stays deleted. The CLAUDE.md block follows the same rules as a file.
 const BASE_DIR = ".ds-base/base", PENDING_DIR = ".ds-base/pending";
 const SIDE = ".ds-base-update", BACKUP = ".ds-base-backup";
 let prevLock = null;
@@ -381,6 +382,7 @@ try { prevLock = JSON.parse(readFileSync(join(HOST, ".ds-base.json"), "utf8")); 
 const readIf = (p) => (existsSync(p) ? readFileSync(p, "utf8") : null);
 const writeAt = (p, text) => { if (DRY) return; mkdirSync(dirname(p), { recursive: true }); writeFileSync(p, text); };
 const removeAt = (p) => { if (!DRY && existsSync(p)) rmSync(p); };
+const freeBackup = (abs) => { let p = abs + BACKUP; for (let n = 2; existsSync(p); n++) p = `${abs}${BACKUP}.${n}`; return p; };
 
 function merge3(current, base, incoming) {
   const dir = join(tmpdir(), `ds-base-merge-${process.pid}-${Math.random().toString(36).slice(2)}`);
@@ -397,13 +399,12 @@ function merge3(current, base, incoming) {
 function apply() {
   for (const { to, content, kind } of plan) {
     const abs = join(HOST, to);
-    const exists = existsSync(abs);
-    const current = exists ? readFileSync(abs, "utf8") : null;
+    const isBlock = kind === "block";
+    const fileText = readIf(abs);
+    const current = isBlock ? findBlock(fileText ?? "")?.text ?? null : fileText;
+    const exists = current !== null;
+    const write = (text) => writeAt(abs, isBlock ? putBlock(fileText ?? "", text) : text);
     if (kind === "ifMissing") { if (!exists) writeAt(abs, content); (exists ? results.same : results.created).push(to); continue; }
-    if (kind === "managed") {
-      if (current === content) { results.same.push(to); continue; }
-      writeAt(abs, content); (exists ? results.updated : results.created).push(to); continue;
-    }
     const basePath = join(HOST, BASE_DIR, to), pendingPath = join(HOST, PENDING_DIR, to), side = abs + SIDE;
     const setBase = () => writeAt(basePath, content);
     let base = readIf(basePath);
@@ -416,24 +417,39 @@ function apply() {
       results.conflicts.push(to); continue;
     }
 
-    if (!exists) { writeAt(abs, content); setBase(); results.created.push(to); continue; }
+    if (!exists && base !== null && !isBlock && !FORCE) { results.removed.push(to); continue; } // the client deleted it
+    if (!exists) { write(content); setBase(); results.created.push(to); continue; }
     if (current === content) { setBase(); results.same.push(to); continue; }
-    if (FORCE) { writeAt(abs + BACKUP, current); writeAt(abs, content); setBase(); results.backups.push(to); continue; }
-    if (base !== null && current === base) { writeAt(abs, content); setBase(); results.updated.push(to); continue; }
+    if (FORCE) {
+      if (base !== null && current === base) results.updated.push(to);
+      else { writeAt(freeBackup(abs), current); results.backups.push(to); }
+      write(content); setBase(); continue;
+    }
+    if (base !== null && current === base) { write(content); setBase(); results.updated.push(to); continue; }
     if (base !== null && content === base) { results.kept.push(to); continue; } // only the client changed it
+    // Installs from before the block had a base: refresh it, keeping the old block as a backup.
+    if (isBlock && base === null) { writeAt(freeBackup(abs), current); write(content); setBase(); results.backups.push(to); continue; }
     const m = base !== null ? merge3(current, base, content) : { ok: false };
-    if (m.ok) { writeAt(abs, m.text); setBase(); results.merged.push(to); continue; }
+    if (m.ok) { write(m.text); setBase(); results.merged.push(to); continue; }
     writeAt(side, content); writeAt(pendingPath, content); results.conflicts.push(to);
   }
 }
 
+const BLOCK_START = "<!-- ds-base:start -->", BLOCK_END = "<!-- ds-base:end -->";
 function claudeBlock(body) {
-  const start = "<!-- ds-base:start -->", end = "<!-- ds-base:end -->";
-  const block = `${start}\n<!-- Managed by ds-base installer; edits inside this block are replaced on update. -->\n${body.trim()}\n${end}\n`;
-  const p = join(HOST, "CLAUDE.md");
-  const cur = existsSync(p) ? readFileSync(p, "utf8") : "";
-  if (cur.includes(start) && cur.includes(end)) return cur.replace(new RegExp(`${start}[\\s\\S]*?${end}\\n?`), block);
-  return (cur ? cur.trimEnd() + "\n\n" : "") + block;
+  return `${BLOCK_START}\n<!-- Managed by ds-base. Edits here are merged on update; project rules belong in docs/agents/local-rules.md. -->\n${body.trim()}\n${BLOCK_END}\n`;
+}
+function findBlock(text) {
+  const start = text.indexOf(BLOCK_START);
+  const close = start < 0 ? -1 : text.indexOf(BLOCK_END, start);
+  if (close < 0) return null;
+  const stop = close + BLOCK_END.length;
+  return { start, end: stop + (text[stop] === "\n" ? 1 : 0), text: `${text.slice(start, stop)}\n` };
+}
+function putBlock(text, block) {
+  const found = findBlock(text);
+  if (found) return text.slice(0, found.start) + block + text.slice(found.end);
+  return (text ? `${text.trimEnd()}\n\n` : "") + block;
 }
 
 // Pulls the reusable sections out of ds-base's own CLAUDE.md (single source of truth),
@@ -527,7 +543,7 @@ const names = (ids) => ids.map((id) => PRODUCTS[id].name).join(", ");
 const missingIds = AVAILABLE.filter((id) => !has(id));
 if (manifest.rulesSnippet)
   claudeParts.push((await source.read(manifest.rulesSnippet)).replace("{{installed}}", names(IDS.filter(has))).replace("{{missing}}", missingIds.length ? names(missingIds) : "nothing — every available product is installed"));
-stage("CLAUDE.md", claudeBlock(claudeParts.join("\n")), "managed");
+stage("CLAUDE.md", claudeBlock(claudeParts.join("\n")), "block");
 
 apply();
 
@@ -593,6 +609,7 @@ line("merged", results.merged, c.g);
 line("yours", results.kept, c.d);
 line("backed up", results.backups, c.y);
 line("to merge", results.conflicts, c.y);
+line("deleted", results.removed, c.d);
 if (orphans.length) {
   console.log(c.y(`  ${orphans.length} file(s) from your previous install aren't part of this install (product not chosen, or moved/removed upstream) — left in place:`));
   for (const f of orphans) console.log(c.y(`    ${f}`));
@@ -603,7 +620,8 @@ if (overrideNotes.length) {
   for (const n of overrideNotes) console.log(c.y(`    ${n}`));
 }
 if (results.merged.length) console.log(c.g(`  ${results.merged.length} file(s) had your edits and ds-base changes merged automatically. Review with git diff.`));
-if (results.backups.length) console.log(c.y(`  --force overwrote ${results.backups.length} edited file(s); your versions are saved beside them as *${BACKUP}.`));
+if (results.backups.length) console.log(c.y(`  ${results.backups.length} file(s) were replaced; your versions are saved beside them as *${BACKUP}.`));
+if (results.removed.length) console.log(c.d(`  ${results.removed.length} file(s) you deleted stayed deleted. To get one back, delete its copy in ${BASE_DIR}/ and run the installer again.`));
 if (results.conflicts.length) {
   console.log(c.y(`  ${results.conflicts.length} file(s) couldn't be merged automatically and were left untouched. The new version is saved beside each:`));
   for (const f of results.conflicts) console.log(c.y(`    ${f}${SIDE}`));
