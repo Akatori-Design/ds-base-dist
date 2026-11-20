@@ -19,7 +19,8 @@
 //   --a11y-level A|AA     accessibility level the agents and checks enforce (T-054). Default AA; asked on
 //                         first install, kept on updates. Change it later with this flag or in .ds-base.json.
 //   --update-kit          also update the installed kit's components (otherwise asked; default No)
-//   --use-stock-tokens <names|all>  replace your values for these tokens with ds-base's (backup kept)
+//   --use-stock-tokens <names|all>  replace your values for these tokens with ds-base's, or take a
+//                         stock fix by its ID (e.g. T-048). A backup is kept.
 //   --site <url>          course site to sign in to (default: set when published)
 //   --github              install from the private repo with a GitHub token (owner)
 //   --ref <branch|tag>    version to install with --github (default: main)
@@ -380,7 +381,7 @@ function stage(to, content, kind = "file") { plan.push({ to, content, kind }); }
 const BASE_DIR = ".ds-base/base", PENDING_DIR = ".ds-base/pending";
 const SIDE = ".ds-base-update", BACKUP = ".ds-base-backup";
 let prevLock = null;
-const tokenNotes = { added: [], held: [], reset: [] };
+const tokenNotes = { added: [], held: [], reset: [], fixes: [] };
 try { prevLock = JSON.parse(readFileSync(join(HOST, ".ds-base.json"), "utf8")); } catch { /* first install */ }
 
 const readIf = (p) => (existsSync(p) ? readFileSync(p, "utf8") : null);
@@ -516,15 +517,32 @@ function useStock(current, incoming, names) {
   return { text, changed: [...new Set([...edits, ...missing].map((d) => d.prop))] };
 }
 const STOCK_TOKENS = (opt("use-stock-tokens") ?? "").split(",").map((x) => x.trim().replace(/^--/, "")).filter(Boolean);
+// Stock fixes change selectors, not values (T-055). Offered while their pattern still matches; taken by ID.
+const isFixId = (x) => /^[TP]-\d{3}$/i.test(x);
+const fixPattern = (f) => new RegExp(f.find, "gm");
+function applyFixes(to, text) {
+  const out = { text, taken: [], open: [] };
+  for (const f of (manifest.kit.fixes ?? []).filter((x) => x.file === to)) {
+    if (!fixPattern(f).test(out.text)) continue;
+    if (STOCK_TOKENS.includes("all") || STOCK_TOKENS.some((x) => x.toUpperCase() === f.id)) { out.text = out.text.replace(fixPattern(f), f.replace); out.taken.push(f.id); }
+    else out.open.push({ id: f.id, file: to, what: f.what, effect: f.effect });
+  }
+  return out;
+}
 function applyTokens(to, abs, current, content) {
   const basePath = join(HOST, BASE_DIR, to), base = readIf(basePath);
   if (current === null) { writeAt(abs, content); writeAt(basePath, content); results.created.push(to); return; }
   let text = current;
   if (STOCK_TOKENS.length) {
-    const r = STOCK_TOKENS.includes("all") ? { text: content, changed: ["every token"] } : useStock(current, content, STOCK_TOKENS);
+    const r = STOCK_TOKENS.includes("all") ? { text: content, changed: ["every token"] } : useStock(current, content, STOCK_TOKENS.filter((x) => !isFixId(x)));
     if (r.text !== current) { writeAt(freeBackup(abs), current); results.backups.push(to); tokenNotes.reset.push(...r.changed.map((t) => `${t} (${to})`)); }
     text = r.text;
   }
+  const fx = applyFixes(to, text);
+  if (fx.taken.length && text === current) { writeAt(freeBackup(abs), current); results.backups.push(to); }
+  tokenNotes.reset.push(...fx.taken.map((id) => `fix ${id} (${to})`));
+  tokenNotes.fixes.push(...fx.open);
+  text = fx.text;
   const r = addNewTokens(text, content);
   tokenNotes.added.push(...r.added);
   tokenNotes.held.push(...stockChanges(base, content, r.text).map((x) => ({ ...x, file: to })));
@@ -784,7 +802,7 @@ if (moveNotes.length) {
   console.log(c.b(`  Stock rules now live in docs/ds-base/ and your rules in docs/rules/ (T-052):`));
   for (const n of moveNotes) console.log(`    ${n}`);
 }
-if (tokenNotes.reset.length) console.log(c.g(`  Stock values restored: ${tokenNotes.reset.join(", ")}. Your previous file is saved beside it as *${BACKUP}.`));
+if (tokenNotes.reset.length) console.log(c.g(`  Taken from stock: ${tokenNotes.reset.join(", ")}. Your previous file is saved beside it as *${BACKUP}.`));
 if (tokenNotes.added.length) console.log(c.g(`  New tokens added: ${[...new Set(tokenNotes.added)].slice(0, 8).join(", ")}${tokenNotes.added.length > 8 ? ", …" : ""}. Your existing values were not changed.`));
 {
   const file = join(HOST, ".ds-base/token-changes.json");
@@ -798,14 +816,19 @@ if (tokenNotes.added.length) console.log(c.g(`  New tokens added: ${[...new Set(
     const now = cssParse(readIf(join(HOST, x.file)) ?? "").decls.find((d) => d.prop === x.token && d.path.at(-1) === x.where);
     if (now && now.value !== x.stock) fresh.set(key(x), { ...x, yours: now.value });
   }
-  const held = [...fresh.values()];
+  const held = [...fresh.values()], fixes = tokenNotes.fixes;
+  if (held.length || fixes.length) writeAt(file, JSON.stringify({ version, note: "Stock changes your token files don't have yet. Nothing was changed. Take one with --use-stock-tokens <token name or fix ID> (or all).", ...(fixes.length ? { fixes } : {}), changes: held }, null, 1) + "\n");
+  else removeAt(file);
+  if (fixes.length) {
+    console.log(c.y(`  ${fixes.length} stock fix(es) not in your token files yet (nothing was changed):`));
+    for (const f of fixes) console.log(c.y(`    ${f.id} (${f.file}): ${f.what}. Take it: --use-stock-tokens ${f.id}. Effect: ${f.effect}.`));
+  }
   if (held.length) {
-    writeAt(file, JSON.stringify({ version, note: "Stock token values that changed upstream. Your values were kept. Apply one with --use-stock-tokens <name> (or all).", changes: held }, null, 1) + "\n");
     console.log(c.y(`  ${held.length} stock token value(s) changed upstream; your values were kept:`));
     for (const x of held.slice(0, 6)) console.log(c.y(`    ${x.token} in ${x.where}: yours ${x.yours ?? "(not set here)"} · stock ${x.stock}`));
     if (held.length > 6) console.log(c.y(`    … and ${held.length - 6} more in .ds-base/token-changes.json`));
     console.log(c.y(`  To take any: --use-stock-tokens <name,name> or --use-stock-tokens all (preview with --dry-run; a backup is kept).`));
-  } else removeAt(file);
+  }
 }
 if (overrideNotes.length) {
   console.log(c.y(`  Rules you override changed upstream (docs/rules/):`));
