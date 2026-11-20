@@ -16,6 +16,8 @@
 //   --check               sign in if needed, list the products you can install, and stop
 //   --sign-out            remove this computer's install key
 //   --agent               legacy: DS Designer only · --with-ux / --no-ux: legacy add/skip UX Designer
+//   --a11y-level A|AA     accessibility level the agents and checks enforce (T-054). Default AA; asked on
+//                         first install, kept on updates. Change it later with this flag or in .ds-base.json.
 //   --update-kit          also update the installed kit's components (otherwise asked; default No)
 //   --use-stock-tokens <names|all>  replace your values for these tokens with ds-base's (backup kept)
 //   --site <url>          course site to sign in to (default: set when published)
@@ -572,9 +574,31 @@ function extractClaudeSections(md, products) {
   return `## Design system (ds-base)\n${owner}${body.replace(/^## /gm, "### ")}`;
 }
 
+// Accessibility level (T-054): what the agents and checks enforce. Kept in .ds-base.json → a11yLevel.
+// Existing installs keep theirs; installs from before this setting become AA (what they enforced already).
+const LEVEL_IDS = ["A", "AA"];
+const A_WARNING = "Level A has no contrast minimums, focus-visible or target-size rules. Most accessibility laws (EU Accessibility Act / EN 301 549, Section 508, ADA practice) reference AA.";
+async function chooseA11yLevel() {
+  const fromFlag = opt("a11y-level");
+  if (fromFlag) {
+    const v = fromFlag.trim().toUpperCase();
+    if (!LEVEL_IDS.includes(v)) die(`Unknown accessibility level "${fromFlag}". Use: ${LEVEL_IDS.join(", ")}`);
+    return v;
+  }
+  if (prevLock) return LEVEL_IDS.includes(prevLock.a11yLevel) ? prevLock.a11yLevel : "AA";
+  if (!process.stdin.isTTY || YES) return "AA";
+  console.log(`\n${c.b("Accessibility level")} ${c.d("(WCAG 2.2) — what the agents and checks enforce. Change it any time.")}`);
+  console.log(`  1) A    ${c.d("minimum only: no contrast, focus-visible or target-size rules. Not enough for most laws.")}`);
+  console.log(`  2) AA   ${c.d("recommended: the legal standard in most places (4.5:1 text, 3:1 UI, 24px targets)")}`);
+  const a = (await ask("Choose [2]: ", "2")).toUpperCase();
+  return { 1: "A", 2: "AA" }[a] ?? (LEVEL_IDS.includes(a) ? a : "AA");
+}
+
 // ---- main --------------------------------------------------------------------------------
 console.log(`${c.b("ds-base installer")}  ${c.d(`source: ${source.label}`)}`);
 const products = await chooseProducts();
+const a11yLevel = await chooseA11yLevel();
+const prevLevel = prevLock ? (LEVEL_IDS.includes(prevLock.a11yLevel) ? prevLock.a11yLevel : "AA") : null;
 const has = (id) => products.has(id);
 const mode = has("kit") ? "all" : "agent"; // kept in .ds-base.json — agents read it to know whether the kit is present
 const manifest = JSON.parse(await source.read("install/manifest.json"));
@@ -644,7 +668,11 @@ if (has("brand")) claudeParts.push(await source.read(manifest.brandDesigner.clau
 const names = (ids) => ids.map((id) => PRODUCTS[id].name).join(", ");
 const missingIds = AVAILABLE.filter((id) => !has(id));
 if (manifest.rulesSnippet)
-  claudeParts.push((await source.read(manifest.rulesSnippet)).replace("{{installed}}", names(IDS.filter(has))).replace("{{missing}}", missingIds.length ? `not installed yet: ${names(missingIds)}` : "everything available is installed"));
+  claudeParts.push((await source.read(manifest.rulesSnippet))
+    .replace("{{installed}}", names(IDS.filter(has)))
+    .replace("{{missing}}", missingIds.length ? `not installed yet: ${names(missingIds)}` : "everything available is installed")
+    .replaceAll("{{a11yLevel}}", a11yLevel)
+    .replace("{{a11yWarning}}", a11yLevel === "A" ? `\n   - ⚠ ${A_WARNING} Treat AA criteria as strong recommendations.` : ""));
 stage("CLAUDE.md", claudeBlock(claudeParts.join("\n")), "block");
 
 // ---- moved files (T-052): stock rules now live in docs/ds-base/, project rules in docs/rules/ ----
@@ -733,7 +761,7 @@ try {
 } catch { /* first install */ }
 
 // Lock file — records what was installed (no secrets)
-const lock = { repo: MODE === "local" ? "local" : MODE === "account" ? "account" : REPO, ref: MODE === "github" ? REF : undefined, version, products: IDS.filter(has), mode, base, installedAt: new Date().toISOString(), files: [...new Set([...plan.map((p) => p.to), ...keptKitFiles])], baseDir: BASE_DIR };
+const lock = { repo: MODE === "local" ? "local" : MODE === "account" ? "account" : REPO, ref: MODE === "github" ? REF : undefined, version, products: IDS.filter(has), mode, a11yLevel, base, installedAt: new Date().toISOString(), files: [...new Set([...plan.map((p) => p.to), ...keptKitFiles])], baseDir: BASE_DIR };
 if (!DRY) writeFileSync(join(HOST, ".ds-base.json"), JSON.stringify(lock, null, 2) + "\n");
 
 // ---- report ------------------------------------------------------------------------------
@@ -837,6 +865,11 @@ if (updateKit && !DRY) {
   for (const [k, v] of Object.entries(manifest.kit.scripts)) if (!pkg.scripts[k]) { pkg.scripts[k] = v; added++; }
   if (added) { writeFileSync(hostPkgPath, JSON.stringify(pkg, null, 2) + "\n"); console.log(c.g(`Added ${added} script(s): ${Object.keys(manifest.kit.scripts).join(", ")}`)); }
 }
+
+// Accessibility level (T-054)
+console.log(`\n${c.b("Accessibility level:")} ${a11yLevel}${prevLevel && prevLevel !== a11yLevel ? c.y(`  (was ${prevLevel})`) : ""} ${c.d("— change with --a11y-level or a11yLevel in .ds-base.json")}`);
+if (a11yLevel === "A") console.log(c.y(`! ${A_WARNING}`));
+if (prevLevel && prevLevel !== a11yLevel) console.log(c.y(`! Record why the level changed: ask the design-system-designer to log it as an L-### in docs/rules/general.md.`));
 
 // Next steps
 console.log(`\n${c.b("Next")}`);
