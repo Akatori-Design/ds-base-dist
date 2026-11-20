@@ -21,7 +21,7 @@ It shows a link and a code, waits for your approval, then asks for the products.
 
 **One computer at a time:** approving a new computer disconnects the previous one. Your account can connect 4 times in any 30 days: your first computer plus three switches. See or disconnect your computer on the course site's install page. All projects on one computer share its connection. The install key is kept in `~/.config/ds-base/install.json`, readable only by you, and never goes into your project.
 
-**Safety:** nothing you changed is overwritten or deleted, and a file you deleted stays deleted. On update, your edits and ds-base's changes merge. A file that can't be merged is left untouched, with the new version saved beside it as `<file>.ds-base-update` (merge it, then delete that file). An installed DS base kit is only updated when you say yes (or pass `--update-kit`). `--force` overwrites, but saves your version as `<file>.ds-base-backup`. Commit `.ds-base/` so merges work for your whole team. Your own rules go in `docs/agents/local-rules.md` (L-###), which updates never touch. `CLAUDE.md` changes stay between `<!-- ds-base:start/end -->` markers, and your edits there merge too. `.ds-base.json` records what was installed.
+**Safety:** nothing you changed is overwritten or deleted, and a file you deleted stays deleted. On update, your edits and ds-base's changes merge. A file that can't be merged is left untouched, with the new version saved beside it as `<file>.ds-base-update` (merge it, then delete that file). **Your token values never change:** updates only add new tokens, and stock value changes are listed in `.ds-base/token-changes.json` for you to take with `--use-stock-tokens <name>` (or `all`). Kit components are only updated when you say yes (or pass `--update-kit`). `--force` overwrites, but saves your version as `<file>.ds-base-backup`. Commit `.ds-base/` so merges work for your whole team. Stock rules live in `docs/ds-base/` and are replaced on update. Your own rules go in `docs/rules/` (L-###), which updates never touch. `CLAUDE.md` changes stay between `<!-- ds-base:start/end -->` markers, and your edits there merge too. `.ds-base.json` records what was installed.
 
 ## For Claude: installing ds-base
 When asked to install ds-base, or given this repo's link, inside a project, follow these steps in order. **Never ask for a password, and never read, print or copy `~/.config/ds-base/install.json`.**
@@ -40,7 +40,7 @@ When asked to install ds-base, or given this repo's link, inside a project, foll
    - **All four remaining** (more options than a question allows): ask two questions in the same call:
      - "Install everything?" with **Install all** / **Choose products**;
      - "Which products?" with the four checkboxes, used only if they choose.
-   - **DS base kit already installed:** ask separately, "Update the DS base kit's tokens and components too?", with **No** as the default. Add `--update-kit` only on an explicit yes.
+   - **DS base kit already installed:** ask separately, "Update the DS base kit's components too?" (token values never change either way), with **No** as the default. Add `--update-kit` only on an explicit yes.
    - Mention the recommendation when both are available: DS Designer + DS base kit for a new project, DS Designer alone for a project with its own design system.
 3. **Run from the project root:**
    ```bash

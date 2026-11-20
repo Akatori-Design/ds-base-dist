@@ -16,7 +16,8 @@
 //   --check               sign in if needed, list the products you can install, and stop
 //   --sign-out            remove this computer's install key
 //   --agent               legacy: DS Designer only · --with-ux / --no-ux: legacy add/skip UX Designer
-//   --update-kit          also update the already-installed DS base kit (otherwise asked; default No)
+//   --update-kit          also update the installed kit's components (otherwise asked; default No)
+//   --use-stock-tokens <names|all>  replace your values for these tokens with ds-base's (backup kept)
 //   --site <url>          course site to sign in to (default: set when published)
 //   --github              install from the private repo with a GitHub token (owner)
 //   --ref <branch|tag>    version to install with --github (default: main)
@@ -26,7 +27,7 @@
 //   --force               overwrite files that differ (default: keep yours, report them)
 //   --dry-run             show what would change, write nothing
 //   --yes                 accept defaults (install dependencies, add scripts)
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, hostname, platform, tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -377,6 +378,7 @@ function stage(to, content, kind = "file") { plan.push({ to, content, kind }); }
 const BASE_DIR = ".ds-base/base", PENDING_DIR = ".ds-base/pending";
 const SIDE = ".ds-base-update", BACKUP = ".ds-base-backup";
 let prevLock = null;
+const tokenNotes = { added: [], held: [], reset: [] };
 try { prevLock = JSON.parse(readFileSync(join(HOST, ".ds-base.json"), "utf8")); } catch { /* first install */ }
 
 const readIf = (p) => (existsSync(p) ? readFileSync(p, "utf8") : null);
@@ -405,6 +407,7 @@ function apply() {
     const exists = current !== null;
     const write = (text) => writeAt(abs, isBlock ? putBlock(fileText ?? "", text) : text);
     if (kind === "ifMissing") { if (!exists) writeAt(abs, content); (exists ? results.same : results.created).push(to); continue; }
+    if (kind === "tokens") { applyTokens(to, abs, fileText, content); continue; }
     const basePath = join(HOST, BASE_DIR, to), pendingPath = join(HOST, PENDING_DIR, to), side = abs + SIDE;
     const setBase = () => writeAt(basePath, content);
     let base = readIf(basePath);
@@ -435,9 +438,101 @@ function apply() {
   }
 }
 
+// ---- token files: the project's values always stay (T-052) -----------------------------------
+// An update never changes a token the project already has, edited or not. It only adds tokens
+// (and new @utility/@keyframes blocks) that don't exist yet. Changed stock values are listed and
+// applied only on request with --use-stock-tokens.
+function cssParse(text) {
+  const src = text.replace(/\/\*[\s\S]*?\*\//g, (m) => " ".repeat(m.length)); // blank comments, keep offsets
+  const decls = [], blocks = [], names = new Set(), stack = [];
+  let from = 0;
+  const named = (stmt) => stmt.match(/^@(utility|keyframes|custom-variant)\s+([\w-]+)/);
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === "{") {
+      const prelude = src.slice(from, i).trim(), n = named(prelude);
+      if (n) names.add(`@${n[1]} ${n[2]}`);
+      stack.push({ prelude, start: from + src.slice(from, i).search(/\S/), name: n && `@${n[1]} ${n[2]}` });
+      from = i + 1;
+    } else if (ch === "}") {
+      const b = stack.pop();
+      if (b?.name) blocks.push({ name: b.name, path: stack.map((x) => x.prelude), text: text.slice(b.start, i + 1) });
+      from = i + 1;
+    } else if (ch === ";") {
+      const stmt = src.slice(from, i), n = named(stmt.trim());
+      if (n) { names.add(`@${n[1]} ${n[2]}`); blocks.push({ name: `@${n[1]} ${n[2]}`, path: stack.map((x) => x.prelude), text: `${stmt.trim()};` }); }
+      const m = stmt.match(/^\s*(--[\w-]+)\s*:\s*([\s\S]*?)\s*$/);
+      if (m && stack.length) decls.push({ path: stack.map((x) => x.prelude), prop: m[1], value: m[2], start: from + stmt.indexOf(m[2], stmt.indexOf(":")), end: from + stmt.indexOf(m[2], stmt.indexOf(":")) + m[2].length, inNamed: stack.some((x) => x.name) });
+      from = i + 1;
+    }
+  }
+  return { decls, blocks, names, props: new Set(decls.map((d) => d.prop)) };
+}
+const declKey = (d) => `${d.path.join(" › ")}|${d.prop}`;
+const wrapIn = (path, inner) => path.reduceRight((body, prelude, k) => `${"  ".repeat(k)}${prelude} {\n${body}\n${"  ".repeat(k)}}`, inner);
+const declLine = (d) => `${"  ".repeat(d.path.length)}${d.prop}: ${d.value};`;
+function addNewTokens(current, incoming) {
+  const cur = cssParse(current), inc = cssParse(incoming);
+  const groups = new Map(), added = [];
+  for (const d of inc.decls) {
+    if (d.inNamed || cur.props.has(d.prop)) continue;
+    const k = d.path.join(" › ");
+    if (!groups.has(k)) groups.set(k, { path: d.path, lines: [] });
+    groups.get(k).lines.push(declLine(d));
+    added.push(d.prop);
+  }
+  const parts = [...groups.values()].map((g) => wrapIn(g.path, g.lines.join("\n")));
+  for (const b of inc.blocks) if (!cur.names.has(b.name)) { parts.push(b.path.length ? wrapIn(b.path, b.text) : b.text); added.push(b.name); }
+  if (!parts.length) return { text: current, added };
+  return { text: `${current.trimEnd()}\n\n/* Added by ds-base ${version.slice(0, 7)}: new tokens only. Values above are never changed by updates (T-052). */\n${parts.join("\n\n")}\n`, added };
+}
+function stockChanges(base, incoming, current) {
+  if (base === null) return [];
+  const old = new Map(cssParse(base).decls.map((d) => [declKey(d), d]));
+  const now = cssParse(current), mine = new Map(now.decls.map((d) => [declKey(d), d])), out = [];
+  for (const d of cssParse(incoming).decls) {
+    if (d.inNamed) continue;
+    const k = declKey(d), was = old.get(k);
+    if ((was && was.value !== d.value) || (!was && now.props.has(d.prop) && !mine.has(k)))
+      out.push({ token: d.prop, where: d.path.at(-1), yours: mine.get(k)?.value ?? null, stock: d.value });
+  }
+  return out;
+}
+function useStock(current, incoming, names) {
+  const want = (p) => names.includes(p.replace(/^--/, ""));
+  const mine = new Map(cssParse(current).decls.map((d) => [declKey(d), d]));
+  const edits = [], missing = [];
+  for (const d of cssParse(incoming).decls) {
+    if (!want(d.prop) || d.inNamed) continue;
+    const have = mine.get(declKey(d));
+    if (have && have.value !== d.value) edits.push({ ...have, value: d.value });
+    else if (!have) missing.push(d);
+  }
+  let text = current;
+  for (const e of edits.sort((x, y) => y.start - x.start)) text = text.slice(0, e.start) + e.value + text.slice(e.end);
+  if (missing.length) text = `${text.trimEnd()}\n\n/* Stock values restored by ds-base ${version.slice(0, 7)} (--use-stock-tokens). */\n${missing.map((d) => wrapIn(d.path, declLine(d))).join("\n\n")}\n`;
+  return { text, changed: [...new Set([...edits, ...missing].map((d) => d.prop))] };
+}
+const STOCK_TOKENS = (opt("use-stock-tokens") ?? "").split(",").map((x) => x.trim().replace(/^--/, "")).filter(Boolean);
+function applyTokens(to, abs, current, content) {
+  const basePath = join(HOST, BASE_DIR, to), base = readIf(basePath);
+  if (current === null) { writeAt(abs, content); writeAt(basePath, content); results.created.push(to); return; }
+  let text = current;
+  if (STOCK_TOKENS.length) {
+    const r = STOCK_TOKENS.includes("all") ? { text: content, changed: ["every token"] } : useStock(current, content, STOCK_TOKENS);
+    if (r.text !== current) { writeAt(freeBackup(abs), current); results.backups.push(to); tokenNotes.reset.push(...r.changed.map((t) => `${t} (${to})`)); }
+    text = r.text;
+  }
+  const r = addNewTokens(text, content);
+  tokenNotes.added.push(...r.added);
+  tokenNotes.held.push(...stockChanges(base, content, r.text).map((x) => ({ ...x, file: to })));
+  if (r.text !== current) { writeAt(abs, r.text); results.updated.push(to); } else results.same.push(to);
+  writeAt(basePath, content);
+}
+
 const BLOCK_START = "<!-- ds-base:start -->", BLOCK_END = "<!-- ds-base:end -->";
 function claudeBlock(body) {
-  return `${BLOCK_START}\n<!-- Managed by ds-base. Edits here are merged on update; project rules belong in docs/agents/local-rules.md. -->\n${body.trim()}\n${BLOCK_END}\n`;
+  return `${BLOCK_START}\n<!-- Managed by ds-base. Edits here are merged on update; project rules belong in docs/rules/ (L-###). -->\n${body.trim()}\n${BLOCK_END}\n`;
 }
 function findBlock(text) {
   const start = text.indexOf(BLOCK_START);
@@ -462,6 +557,9 @@ function extractClaudeSections(md, products) {
     !products.has("ux") && "ux-designer.md",
     !products.has("ux") && "components/ux-tools/",
     !products.has("brand") && "brand-designer.md",
+    // Rows a project never needs in context: the agents have their own notes below, rule paths are
+    // in "ds-base rules & updates", and the installer and contrast gate belong to ds-base itself.
+    "Installer, client packages", "Contrast gate", "DS owner agent", "Brand designer agent", "UX designer agent", "Stock rules (", "Project rules in installed",
   ].filter(Boolean);
   const parts = md.split(/\n(?=## )/);
   const body = parts
@@ -491,6 +589,8 @@ const stageDirs = async (dirs) => {
     for (const p of (await listFiles()).filter((f) => f.startsWith(dir + "/") && !skipStories.test(f))) stage(codePath(p), await source.read(p));
 };
 
+// Stock rules and the rule-index tool, for every product (T-052)
+for (const p of manifest.shared?.root ?? []) stage(p, await source.read(p));
 if ((has("ux") || has("brand")) && !has("ds"))
   console.log(c.y(`! ${[has("ux") && "UX", has("brand") && "Brand"].filter(Boolean).join(" and ")} Designer hand system changes to the DS Designer. Without it they list those requests for you instead.`));
 
@@ -504,9 +604,9 @@ if (has("ux")) {
 }
 // 3) Brand Designer
 if (has("brand")) for (const p of manifest.brandDesigner.root) stage(p, await source.read(p));
-// The project's own rules file (L-###), created once and never updated (T-045)
+// The project's own rules (docs/rules/, L-###), created once and never updated (T-045, T-052)
 for (const [to, from] of Object.entries(manifest.hostTemplates ?? {})) if (!to.startsWith("$")) stage(to, await source.read(from), "ifMissing");
-// 4) DS base kit — once installed, it's only updated when the user says so (T-045)
+// 4) DS base kit — token files always update safely (additions only, T-052); components only when the user says so (T-045)
 const kitInstalled = installedProducts().has("kit");
 let updateKit = has("kit");
 if (has("kit") && kitInstalled) {
@@ -514,11 +614,13 @@ if (has("kit") && kitInstalled) {
   else if (flag("no-update-kit") || YES || !process.stdin.isTTY) updateKit = false;
   else {
     console.log(`\n${c.b("The DS base kit is already installed.")} ${c.d("Updating merges your edits; nothing is overwritten.")}`);
-    updateKit = /^y/i.test(await ask("Update its tokens and components too? [y/N]: ", "n"));
+    updateKit = /^y/i.test(await ask("Update its components too? Your token values never change. [y/N]: ", "n"));
   }
 }
+const tokenFiles = new Set(manifest.kit.tokens ?? []);
+if (has("kit")) for (const p of tokenFiles) stage(p, await source.read(p), "tokens");
 const kitPaths = async () => [
-  ...manifest.kit.root, ...(manifest.kit.ifMissing ?? []), ...manifest.kit.code.map(codePath),
+  ...manifest.kit.root.filter((p) => !tokenFiles.has(p)), ...(manifest.kit.ifMissing ?? []), ...manifest.kit.code.map(codePath),
   ...(await listFiles()).filter((f) => manifest.kit.codeDirs.some((d) => f.startsWith(d + "/")) && !skipStories.test(f)).map(codePath),
 ];
 const keptKitFiles = has("kit") && !updateKit ? await kitPaths() : []; // still installed, just not touched
@@ -526,7 +628,7 @@ if (updateKit) {
   const tw = allDeps.tailwindcss;
   if (!tw) console.log(c.y("! tailwindcss not found in package.json — the DS base kit needs Tailwind CSS v4."));
   else if (!/^[\^~]?4|^latest|^next/.test(tw)) console.log(c.y(`! tailwindcss ${tw} detected — ds-base tokens require v4 (@theme, @utility).`));
-  for (const p of manifest.kit.root) stage(p, await source.read(p));
+  for (const p of manifest.kit.root.filter((x) => !tokenFiles.has(x))) stage(p, await source.read(p));
   for (const p of manifest.kit.ifMissing ?? []) stage(p, await source.read(p), "ifMissing");
   for (const p of manifest.kit.code) stage(codePath(p), await source.read(p));
   await stageDirs(manifest.kit.codeDirs);
@@ -542,10 +644,43 @@ if (has("brand")) claudeParts.push(await source.read(manifest.brandDesigner.clau
 const names = (ids) => ids.map((id) => PRODUCTS[id].name).join(", ");
 const missingIds = AVAILABLE.filter((id) => !has(id));
 if (manifest.rulesSnippet)
-  claudeParts.push((await source.read(manifest.rulesSnippet)).replace("{{installed}}", names(IDS.filter(has))).replace("{{missing}}", missingIds.length ? names(missingIds) : "nothing — every available product is installed"));
+  claudeParts.push((await source.read(manifest.rulesSnippet)).replace("{{installed}}", names(IDS.filter(has))).replace("{{missing}}", missingIds.length ? `not installed yet: ${names(missingIds)}` : "everything available is installed"));
 stage("CLAUDE.md", claudeBlock(claudeParts.join("\n")), "block");
 
+// ---- moved files (T-052): stock rules now live in docs/ds-base/, project rules in docs/rules/ ----
+const moveNotes = [], movedFrom = new Set();
+const firstRulesRun = !!prevLock && !(prevLock.files ?? []).some((f) => f.startsWith("docs/ds-base/"));
+for (const [from, to] of Object.entries(manifest.moved ?? {})) {
+  if (from.startsWith("$")) continue;
+  const abs = join(HOST, from);
+  if (!existsSync(abs)) continue;
+  movedFrom.add(from);
+  const text = readFileSync(abs, "utf8");
+  if (to.startsWith("docs/rules/")) { // project rules: move the L-entries, leave a pointer behind
+    const rules = text.split(/\n(?=## L-\d+)/).slice(1).join("\n").trim();
+    if (!rules) { if (firstRulesRun) moveNotes.push(`${from} has no rules of yours; new rules go in docs/rules/. You can delete it.`); continue; }
+    const target = join(HOST, to);
+    const header = readIf(target) ?? (await source.read(manifest.hostTemplates[to]));
+    writeAt(target, `${header.trimEnd()}\n\n${rules}\n`);
+    writeAt(abs, `# Moved\n\nThis project's rules moved to \`${to}\` (indexed in \`docs/rules/INDEX.md\`) when ds-base split stock and project rules (T-052). You can delete this file.\n`);
+    moveNotes.push(`Your L-rules moved from ${from} to ${to}.`);
+    continue;
+  }
+  const basePath = join(HOST, BASE_DIR, from), base = readIf(basePath);
+  if (base !== null && text === base) { removeAt(abs); removeAt(basePath); moveNotes.push(`${from} → ${to} (stock, unchanged)`); continue; }
+  const stockIds = new Set([...(await source.read(to)).matchAll(/^## ([TP]-\d+)/gm)].map((m) => m[1]));
+  const yours = [...text.matchAll(/^## ([TP]-\d+)/gm)].map((m) => m[1]).filter((id) => !stockIds.has(id));
+  moveNotes.push(`${from} has your edits, so it was kept. ds-base's copy is now ${to}.${yours.length ? ` Your own entries (${yours.join(", ")}) should become L-rules in docs/rules/.` : ""} Delete it once nothing you need is left in it.`);
+}
+if (existsSync(join(HOST, "docs/ux/CONVENTIONS.md"))) movedFrom.add("docs/ux/CONVENTIONS.md"); // project-owned since T-052
+if (firstRulesRun && has("ux") && existsSync(join(HOST, "docs/ux/CONVENTIONS.md")))
+  moveNotes.push("docs/ux/CONVENTIONS.md is yours. Stock conventions are now in docs/ds-base/ux/CONVENTIONS.md; move your own placements into docs/rules/ux.md as L-rules.");
+
 apply();
+if (!DRY && existsSync(join(HOST, "scripts/ds-rules.mjs"))) {
+  try { execSync(`"${process.execPath}" scripts/ds-rules.mjs`, { cwd: HOST, stdio: "pipe" }); }
+  catch (e) { console.log(c.y(`! The project rule index couldn't be rebuilt:\n${e.stdout}${e.stderr}`)); }
+}
 
 // ---- rules you override that changed upstream (T-045) --------------------------------------
 // Fingerprints every ds-base rule (T-/P- entries, agent and playbook sections) into
@@ -556,9 +691,9 @@ async function ruleFingerprints() {
   const out = {};
   const files = await listFiles();
   const read = async (p) => (files.includes(p) ? await source.read(p) : "");
-  for (const p of ["tokens/DECISIONS.md", "docs/PRODUCT_RULES.md"])
+  for (const p of ["docs/ds-base/DECISIONS.md", "docs/ds-base/PRODUCT_RULES.md", "tokens/DECISIONS.md", "docs/PRODUCT_RULES.md"])
     for (const part of (await read(p)).split(/\n(?=## [TP]-\d+)/)) { const id = part.match(/^## ([TP]-\d+)/)?.[1]; if (id) out[id.toLowerCase()] = hash(part); }
-  for (const p of files.filter((f) => /^\.claude\/agents\/[^/]+\.md$/.test(f) || f === "docs/agents/ds-playbook.md")) {
+  for (const p of files.filter((f) => /^\.claude\/agents\/[^/]+\.md$/.test(f) || /(^|\/)ds-playbook\.md$/.test(f))) {
     const doc = p.split("/").pop().replace(/\.md$/, "");
     for (const part of (await read(p)).split(/\n(?=## )/)) { const h = part.match(/^## (.+)/)?.[1]; if (h) out[`${doc}#${h.trim()}`.toLowerCase()] = hash(part); }
   }
@@ -569,7 +704,9 @@ const overrideNotes = [];
   const now = await ruleFingerprints();
   let before = null;
   try { before = JSON.parse(readFileSync(join(HOST, RULES), "utf8")); } catch { /* first run */ }
-  const local = (() => { try { return readFileSync(join(HOST, "docs/agents/local-rules.md"), "utf8"); } catch { return ""; } })();
+  const rulesDir = join(HOST, "docs/rules");
+  const local = [join(HOST, "docs/agents/local-rules.md"), ...(existsSync(rulesDir) ? readdirSync(rulesDir).filter((f) => f.endsWith(".md")).map((f) => join(rulesDir, f)) : [])]
+    .map((f) => readIf(f) ?? "").join("\n");
   if (before) for (const block of local.split(/\n(?=## L-\d+)/)) {
     const id = block.match(/^## (L-\d+)/)?.[1];
     const refs = (block.match(/\*{0,2}Overrides:\*{0,2}\s*(.+)/)?.[1] ?? "").split(",").map((r) => r.trim().replace(/`/g, "")).filter((r) => r && !/^none$/i.test(r));
@@ -592,7 +729,7 @@ let orphans = [];
 try {
   const prev = JSON.parse(readFileSync(join(HOST, ".ds-base.json"), "utf8"));
   const now = new Set([...plan.map((p) => p.to), ...keptKitFiles]);
-  orphans = (prev.files ?? []).filter((f) => !now.has(f) && existsSync(join(HOST, f)));
+  orphans = (prev.files ?? []).filter((f) => !now.has(f) && !movedFrom.has(f) && existsSync(join(HOST, f)));
 } catch { /* first install */ }
 
 // Lock file — records what was installed (no secrets)
@@ -615,8 +752,36 @@ if (orphans.length) {
   for (const f of orphans) console.log(c.y(`    ${f}`));
   console.log(c.y(`  Delete them once nothing imports them.`));
 }
+if (moveNotes.length) {
+  console.log(c.b(`  Stock rules now live in docs/ds-base/ and your rules in docs/rules/ (T-052):`));
+  for (const n of moveNotes) console.log(`    ${n}`);
+}
+if (tokenNotes.reset.length) console.log(c.g(`  Stock values restored: ${tokenNotes.reset.join(", ")}. Your previous file is saved beside it as *${BACKUP}.`));
+if (tokenNotes.added.length) console.log(c.g(`  New tokens added: ${[...new Set(tokenNotes.added)].slice(0, 8).join(", ")}${tokenNotes.added.length > 8 ? ", …" : ""}. Your existing values were not changed.`));
+{
+  const file = join(HOST, ".ds-base/token-changes.json");
+  // Keep earlier held-back values listed until the project takes them (or sets the stock value itself).
+  const key = (x) => `${x.file}|${x.where}|${x.token}`;
+  const fresh = new Map(tokenNotes.held.filter((x) => x.yours !== x.stock).map((x) => [key(x), x]));
+  let earlier = [];
+  try { earlier = JSON.parse(readFileSync(file, "utf8")).changes ?? []; } catch { /* none yet */ }
+  for (const x of earlier) {
+    if (fresh.has(key(x)) || !tokenFiles.has(x.file)) continue;
+    const now = cssParse(readIf(join(HOST, x.file)) ?? "").decls.find((d) => d.prop === x.token && d.path.at(-1) === x.where);
+    if (now && now.value !== x.stock) fresh.set(key(x), { ...x, yours: now.value });
+  }
+  const held = [...fresh.values()];
+  if (held.length) {
+    writeAt(file, JSON.stringify({ version, note: "Stock token values that changed upstream. Your values were kept. Apply one with --use-stock-tokens <name> (or all).", changes: held }, null, 1) + "\n");
+    console.log(c.y(`  ${held.length} stock token value(s) changed upstream; your values were kept:`));
+    for (const x of held.slice(0, 6)) console.log(c.y(`    ${x.token} in ${x.where}: yours ${x.yours ?? "(not set here)"} · stock ${x.stock}`));
+    if (held.length > 6) console.log(c.y(`    … and ${held.length - 6} more in .ds-base/token-changes.json`));
+    console.log(c.y(`  To take any: --use-stock-tokens <name,name> or --use-stock-tokens all (preview with --dry-run; a backup is kept).`));
+  } else removeAt(file);
+}
 if (overrideNotes.length) {
-  console.log(c.y(`  Rules you override changed upstream (docs/agents/local-rules.md):`));
+  console.log(c.y(`  Rules you override changed upstream (docs/rules/):`));
+
   for (const n of overrideNotes) console.log(c.y(`    ${n}`));
 }
 if (results.merged.length) console.log(c.g(`  ${results.merged.length} file(s) had your edits and ds-base changes merged automatically. Review with git diff.`));
@@ -635,7 +800,7 @@ if (results.conflicts.length) {
 }
 
 // Dependencies (kit and/or UX tools) & scripts (kit only)
-if (keptKitFiles.length) console.log(c.d(`  DS base kit left as-is (tokens and components untouched). Update it with --update-kit.`));
+if (keptKitFiles.length) console.log(c.d(`  DS base kit components left as-is. Update them with --update-kit. Token files only gained new tokens.`));
 const wantDeps = [...(updateKit ? manifest.kit.dependencies : []), ...(has("ux") ? manifest.uxDesigner.dependencies ?? [] : [])];
 const wantDev = updateKit ? manifest.kit.devDependencies : [];
 if ((wantDeps.length || wantDev.length) && !DRY) {
@@ -683,7 +848,7 @@ if (updateKit && !kitInstalled) {
   console.log(`  • Wrap the app once in <TooltipProvider> (components/ui/tooltip).`);
   console.log(`  • Check: npm run ds:contrast && npm run ds:lint`);
 }
-if (has("ds")) console.log(`  • Design-system work: ask for the ${c.b("design-system-designer")} agent. On first use it inspects this project and fills tokens/DECISIONS.md as decisions are made.`);
+if (has("ds")) console.log(`  • Design-system work: ask for the ${c.b("design-system-designer")} agent. On first use it inspects this project; its rules for this project go in docs/rules/.`);
 if (has("ux")) {
   console.log(`  • UX work: ask for the ${c.b("ux-designer")} agent ("design the onboarding flow"). Specs go to docs/ux/.`);
   console.log(`  • Mount ${c.b("<DevControls />")} once at the app root (components/ux-tools, dev builds only).`);
