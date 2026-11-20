@@ -731,6 +731,14 @@ if (!DRY && existsSync(join(HOST, "scripts/ds-rules.mjs"))) {
 // ---- rules you override that changed upstream (T-045) --------------------------------------
 // Fingerprints every ds-base rule (T-/P- entries, agent and playbook sections) into
 // .ds-base/rules.json; on update, L-rules whose Overrides: point at a changed rule are reported.
+// IDs (T-/P-/L-###) and agent sections (ux-designer#Motion) on an Overrides: line. Notes in
+// parentheses are ignored, so "T-025 (sprint as default)" and "none (extends T-035)" read correctly.
+const overrideRefs = (line = "") => {
+  let s = line.replace(/`/g, "");
+  for (let prev; prev !== s; ) { prev = s; s = s.replace(/\([^()]*\)/g, ""); }
+  return s.split(/[,;]/).map((r) => r.trim()).filter((r) => r && !/^none\b/i.test(r))
+    .flatMap((r) => (r.includes("#") ? [r] : r.match(/\b[TPL]-\d{3}\b/gi) ?? []).map((x) => (x.includes("#") ? x : x.toUpperCase())));
+};
 const RULES = ".ds-base/rules.json";
 const hash = (t) => createHash("sha256").update(t.trim()).digest("hex").slice(0, 16);
 async function ruleFingerprints() {
@@ -755,7 +763,7 @@ const overrideNotes = [];
     .map((f) => readIf(f) ?? "").join("\n");
   if (before) for (const block of local.split(/\n(?=## L-\d+)/)) {
     const id = block.match(/^## (L-\d+)/)?.[1];
-    const refs = (block.match(/\*{0,2}Overrides:\*{0,2}\s*(.+)/)?.[1] ?? "").split(",").map((r) => r.trim().replace(/`/g, "")).filter((r) => r && !/^none$/i.test(r));
+    const refs = overrideRefs(block.match(/\*{0,2}Overrides:\*{0,2}\s*(.+)/)?.[1]);
     if (!id) continue;
     for (const ref of refs) {
       const key = ref.toLowerCase();
