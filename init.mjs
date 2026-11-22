@@ -458,6 +458,8 @@ function cssParse(text) {
       stack.push({ prelude, start: from + src.slice(from, i).search(/\S/), name: n && `@${n[1]} ${n[2]}` });
       from = i + 1;
     } else if (ch === "}") {
+      const tail = src.slice(from, i), m = tail.match(/^\s*(--[\w-]+)\s*:\s*([\s\S]*?)\s*$/);   // last declaration may omit ";"
+      if (m && stack.length) decls.push({ path: stack.map((x) => x.prelude), prop: m[1], value: m[2], start: from + tail.indexOf(m[2], tail.indexOf(":")), end: from + tail.indexOf(m[2], tail.indexOf(":")) + m[2].length, inNamed: stack.some((x) => x.name) });
       const b = stack.pop();
       if (b?.name) blocks.push({ name: b.name, path: stack.map((x) => x.prelude), text: text.slice(b.start, i + 1) });
       from = i + 1;
@@ -471,7 +473,9 @@ function cssParse(text) {
   }
   return { decls, blocks, names, props: new Set(decls.map((d) => d.prop)) };
 }
-const declKey = (d) => `${d.path.join(" › ")}|${d.prop}`;
+// `[data-x]` and `:root[data-x]` (T-048) are the same place for a token; so is any whitespace difference.
+const normSel = (p) => p.replace(/\s+/g, " ").replace(/(^|,\s*):root(?=\[)/g, "$1").trim();
+const declKey = (d) => `${d.path.map(normSel).join(" › ")}|${d.prop}`;
 const wrapIn = (path, inner) => path.reduceRight((body, prelude, k) => `${"  ".repeat(k)}${prelude} {\n${body}\n${"  ".repeat(k)}}`, inner);
 const declLine = (d) => `${"  ".repeat(d.path.length)}${d.prop}: ${d.value};`;
 function addNewTokens(current, incoming) {
@@ -516,7 +520,10 @@ function useStock(current, incoming, names) {
   if (missing.length) text = `${text.trimEnd()}\n\n/* Stock values restored by ds-base ${version.slice(0, 7)} (--use-stock-tokens). */\n${missing.map((d) => wrapIn(d.path, declLine(d))).join("\n\n")}\n`;
   return { text, changed: [...new Set([...edits, ...missing].map((d) => d.prop))] };
 }
-const STOCK_TOKENS = (opt("use-stock-tokens") ?? "").split(",").map((x) => x.trim().replace(/^--/, "")).filter(Boolean);
+// Token names start with "--", so only the installer's own flags end this value.
+const OWN_FLAGS = new Set(["a11y-level", "agent", "all", "check", "dir", "dry-run", "force", "github", "no-update-kit", "products", "ref", "repo", "sign-out", "site", "source", "update-kit", "use-stock-tokens", "with-ux", "yes"]);
+const stockArg = () => { const i = argv.indexOf("--use-stock-tokens"), v = argv[i + 1]; return i >= 0 && v && !OWN_FLAGS.has(v.replace(/^--/, "")) ? v : undefined; };
+const STOCK_TOKENS = (stockArg() ?? "").split(",").map((x) => x.trim().replace(/^--/, "")).filter(Boolean);
 // Stock fixes change selectors, not values (T-055). Offered while their pattern still matches; taken by ID.
 const isFixId = (x) => /^[TP]-\d{3}$/i.test(x);
 const fixPattern = (f) => new RegExp(f.find, "gm");
@@ -661,6 +668,7 @@ if (has("kit") && kitInstalled) {
 }
 const tokenFiles = new Set(manifest.kit.tokens ?? []);
 if (has("kit")) for (const p of tokenFiles) stage(p, await source.read(p), "tokens");
+if (has("kit")) for (const p of manifest.kit.tools ?? []) stage(p, await source.read(p)); // checks always update (merged), so gate fixes reach every project
 const kitPaths = async () => [
   ...manifest.kit.root.filter((p) => !tokenFiles.has(p)), ...(manifest.kit.ifMissing ?? []), ...manifest.kit.code.map(codePath),
   ...(await listFiles()).filter((f) => manifest.kit.codeDirs.some((d) => f.startsWith(d + "/")) && !skipStories.test(f)).map(codePath),
@@ -694,7 +702,7 @@ if (manifest.rulesSnippet)
 stage("CLAUDE.md", claudeBlock(claudeParts.join("\n")), "block");
 
 // ---- moved files (T-052): stock rules now live in docs/ds-base/, project rules in docs/rules/ ----
-const moveNotes = [], movedFrom = new Set();
+const moveNotes = [], movedFrom = new Set(), movedNoted = new Set();
 const firstRulesRun = !!prevLock && !(prevLock.files ?? []).some((f) => f.startsWith("docs/ds-base/"));
 for (const [from, to] of Object.entries(manifest.moved ?? {})) {
   if (from.startsWith("$")) continue;
@@ -714,6 +722,11 @@ for (const [from, to] of Object.entries(manifest.moved ?? {})) {
   }
   const basePath = join(HOST, BASE_DIR, from), base = readIf(basePath);
   if (base !== null && text === base) { removeAt(abs); removeAt(basePath); moveNotes.push(`${from} → ${to} (stock, unchanged)`); continue; }
+  if (base === null) { // installed before base copies existed: we can't tell whether it was edited
+    if (!(prevLock?.movedNoted ?? []).includes(from)) moveNotes.push(`${from} is an old copy of ${to}. ds-base has no record of what was installed there, so it can't tell whether you edited it. Compare the two; if nothing of yours is in it, delete it.`);
+    movedNoted.add(from);
+    continue;
+  }
   const stockIds = new Set([...(await source.read(to)).matchAll(/^## ([TP]-\d+)/gm)].map((m) => m[1]));
   const yours = [...text.matchAll(/^## ([TP]-\d+)/gm)].map((m) => m[1]).filter((id) => !stockIds.has(id));
   moveNotes.push(`${from} has your edits, so it was kept. ds-base's copy is now ${to}.${yours.length ? ` Your own entries (${yours.join(", ")}) should become L-rules in docs/rules/.` : ""} Delete it once nothing you need is left in it.`);
@@ -775,6 +788,16 @@ const overrideNotes = [];
     }
   }
   writeAt(join(HOST, RULES), JSON.stringify(now, null, 1) + "\n");
+  // Keep each note listed until the L-rule it names is edited or removed (the fingerprints above move on every run).
+  const notesFile = join(HOST, ".ds-base/override-changes.json");
+  const ruleHash = new Map(local.split(/\n(?=## L-\d+)/).map((b) => [b.match(/^## (L-\d+)/)?.[1], hash(b)]).filter(([id]) => id));
+  let earlier = [];
+  try { earlier = JSON.parse(readFileSync(notesFile, "utf8")).notes ?? []; } catch { /* none yet */ }
+  const keep = earlier.filter((n) => ruleHash.get(n.id) === n.rule && !overrideNotes.includes(n.note)).map((n) => n.note);
+  overrideNotes.push(...keep);
+  const saved = overrideNotes.map((note) => { const id = note.match(/^L-\d+/)?.[0]; return { id, rule: ruleHash.get(id), note }; });
+  if (saved.length) writeAt(notesFile, JSON.stringify({ note: "Stock rules your L-rules override changed upstream. Each stays listed until you edit or remove that L-rule.", notes: saved }, null, 1) + "\n");
+  else if (existsSync(notesFile)) removeAt(notesFile);
 }
 
 // Files from the previous install that ds-base no longer ships (moved/removed upstream).
@@ -787,7 +810,7 @@ try {
 } catch { /* first install */ }
 
 // Lock file — records what was installed (no secrets)
-const lock = { repo: MODE === "local" ? "local" : MODE === "account" ? "account" : REPO, ref: MODE === "github" ? REF : undefined, version, products: IDS.filter(has), mode, a11yLevel, base, installedAt: new Date().toISOString(), files: [...new Set([...plan.map((p) => p.to), ...keptKitFiles])], baseDir: BASE_DIR };
+const lock = { repo: MODE === "local" ? "local" : MODE === "account" ? "account" : REPO, ref: MODE === "github" ? REF : undefined, version, products: IDS.filter(has), mode, a11yLevel, base, installedAt: new Date().toISOString(), ...(movedNoted.size ? { movedNoted: [...movedNoted] } : {}), files: [...new Set([...plan.map((p) => p.to), ...keptKitFiles])], baseDir: BASE_DIR };
 if (!DRY) writeFileSync(join(HOST, ".ds-base.json"), JSON.stringify(lock, null, 2) + "\n");
 
 // ---- report ------------------------------------------------------------------------------
@@ -822,7 +845,7 @@ if (tokenNotes.added.length) console.log(c.g(`  New tokens added: ${[...new Set(
   for (const x of earlier) {
     if (fresh.has(key(x)) || !tokenFiles.has(x.file)) continue;
     const now = cssParse(readIf(join(HOST, x.file)) ?? "").decls.find((d) => d.prop === x.token && d.path.at(-1) === x.where);
-    if (now && now.value !== x.stock) fresh.set(key(x), { ...x, yours: now.value });
+    if (!now || now.value !== x.stock) fresh.set(key(x), { ...x, yours: now?.value ?? null });   // "not set here" stays listed too
   }
   const held = [...fresh.values()], fixes = tokenNotes.fixes;
   if (held.length || fixes.length) writeAt(file, JSON.stringify({ version, note: "Stock changes your token files don't have yet. Nothing was changed. Take one with --use-stock-tokens <token name or fix ID> (or all).", ...(fixes.length ? { fixes } : {}), changes: held }, null, 1) + "\n");
