@@ -912,12 +912,11 @@ if ((wantDeps.length || wantDev.length) && !DRY) {
     else console.log(`Run later:\n  ${cmds.join("\n  ")}`);
   }
 }
-if (updateKit && !DRY) {
+if (has("kit") && !DRY) {   // missing ds:* scripts are added on every run (never changed or removed)
   const pkg = JSON.parse(readFileSync(hostPkgPath, "utf8"));
   pkg.scripts ??= {};
-  let added = 0;
-  for (const [k, v] of Object.entries(manifest.kit.scripts)) if (!pkg.scripts[k]) { pkg.scripts[k] = v; added++; }
-  if (added) { writeFileSync(hostPkgPath, JSON.stringify(pkg, null, 2) + "\n"); console.log(c.g(`Added ${added} script(s): ${Object.keys(manifest.kit.scripts).join(", ")}`)); }
+  const added = Object.entries(manifest.kit.scripts).filter(([k]) => !pkg.scripts[k]).map(([k, v]) => ((pkg.scripts[k] = v), k));
+  if (added.length) { writeFileSync(hostPkgPath, JSON.stringify(pkg, null, 2) + "\n"); console.log(c.g(`Added ${added.length} script(s): ${added.join(", ")}`)); }
 }
 
 // Accessibility level (T-054)
