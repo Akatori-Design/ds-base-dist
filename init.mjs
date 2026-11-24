@@ -881,10 +881,10 @@ if (results.conflicts.length) {
   }
 }
 
-// Dependencies (kit and/or UX tools) & scripts (kit only)
+// Dependencies (kit, UX tools, brand kit renderer) & scripts (kit only)
 if (keptKitFiles.length) console.log(c.d(`  DS base kit components left as-is. Update them with --update-kit. Token files only gained new tokens.`));
 const wantDeps = [...(updateKit ? manifest.kit.dependencies : []), ...(has("ux") ? manifest.uxDesigner.dependencies ?? [] : [])];
-const wantDev = updateKit ? manifest.kit.devDependencies : [];
+const wantDev = [...(updateKit ? manifest.kit.devDependencies : []), ...(has("brand") ? manifest.brandDesigner.devDependencies ?? [] : [])];
 if ((wantDeps.length || wantDev.length) && !DRY) {
   // Entries may be "name@range" (e.g. "@tanstack/react-table@^8"); presence is checked by name.
   const depName = (d) => d.replace(/^(@?[^@]+)@.*$/, "$1");
